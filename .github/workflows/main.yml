@@ -1,8 +1,6 @@
-name: Проверка сборки MestoChat
+name: Проверка и сборка MestoChat
 
-on:
-  push:
-    branches: [ main ]
+on: push
 
 jobs:
   build:
@@ -12,7 +10,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Установить зависимости
-        run: pip install pyqt5 pyinstaller
-      - name: Сборка EXE
+        run: pip install pyqt5 pyinstaller flake8
+
+      - name: Проверка синтаксиса (flake8)
+        run: flake8 MestoChat.py --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Собрать EXE
         run: pyinstaller MestoChat.spec
+
+      - name: Загрузить EXE как артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: MestoChat-EXE
+          path: dist/MestoChat.exe
