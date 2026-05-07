@@ -243,7 +243,7 @@ class ChatDatabase:
     # (дальнейшие методы ChatDatabase без изменений: get_nickname, set_nickname...
     # они полностью идентичны предыдущей версии и здесь опущены для краткости)
     pass
-    // начало второй части
+    
 
 # ====================== СЕТЕВОЙ ДВИЖОК ======================
 executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="Mesto")
@@ -1000,7 +1000,7 @@ class NetworkCore(QObject):
             else:
                 if self._send_message_raw(peer_id, text):
                     self.db.mark_sent(msg_id)
-// начало третьей части
+
 
 # ====================== GUI ======================
 class ChatDisplay(QTextEdit):
