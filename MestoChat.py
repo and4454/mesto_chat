@@ -1,18 +1,19 @@
-import sys, os, socket, threading, json, time, struct, uuid, random, logging, zipfile, tempfile, shutil, sqlite3, hashlib
+import sys, os, socket, threading, json, time, struct, uuid, random, logging, zipfile, tempfile, shutil, sqlite3, hashlib, html
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton,
     QLabel, QMessageBox, QFileDialog, QSplitter, QSystemTrayIcon, QMenu, QAction,
     QDialog, QFormLayout, QDialogButtonBox, QStyle, QStackedWidget, QInputDialog,
-    QTabWidget, QSpinBox, QScrollBar
+    QTabWidget, QSpinBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QUrl
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QTextCursor, QDesktopServices, QPixmap
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QTextCursor, QDesktopServices, QPixmap, QDragMoveEvent
 
 # ----------------------------------------------------------------------
 # Конфигурация
@@ -331,7 +332,7 @@ class ChatDatabase:
             self.conn.commit()
 
 # ----------------------------------------------------------------------
-# Сетевой движок с минимальной защитой
+# Сетевой движок
 # ----------------------------------------------------------------------
 executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="Mesto")
 MAX_CONNECTIONS = 20
@@ -367,6 +368,8 @@ class NetworkCore(QObject):
         self.running = True
         self.local_ips = get_all_local_ips()
         self.lock = threading.RLock()
+        self.shared_secret = config.get('shared_secret', '')
+        self.room_hash = hashlib.sha256(self.shared_secret.encode()).hexdigest() if self.shared_secret else ''
         self.peer_ips_history = defaultdict(set)
         self.peers = {}            # machine_id: (ips, nickname, last_hello, chat_port, file_port)
         self.connections = {}
@@ -374,16 +377,18 @@ class NetworkCore(QObject):
         self.last_pong = {}
         self.reconnect_attempts = defaultdict(int)
 
-        self.shared_secret = config.get('shared_secret', '')
-        self.room_hash = hashlib.sha256(self.shared_secret.encode()).hexdigest() if self.shared_secret else ''
-
         self.udp_sock = None
         self.chat_server_sock = None
         self.file_server_sock = None
 
-        self._start_udp_listener()
-        self._start_chat_server()
-        self._start_file_server()
+        try:
+            self._start_udp_listener()
+            self._start_chat_server()
+            self._start_file_server()
+        except Exception as e:
+            logger.error(f"Failed to start network services: {e}")
+            self.network_error.emit(f"Не удалось запустить сетевые службы: {e}")
+
         self._send_hello()
         executor.submit(self._heartbeat_loop)
         self._merge_contacts()
@@ -451,11 +456,6 @@ class NetworkCore(QObject):
         sock.sendto(msg.encode(), ('255.255.255.255', self.broadcast_port))
         sock.close()
 
-    def _validate_hello(self, msg):
-        if not self.shared_secret:
-            return True
-        return msg.get('room_hash') == self.room_hash
-
     def _validate_message(self, data, required_type=None):
         if 'type' not in data:
             return False
@@ -468,6 +468,11 @@ class NetworkCore(QObject):
                 logger.warning(f"Missing key '{key}' in message type {msg_type}")
                 return False
         return True
+
+    def _validate_hello(self, msg):
+        if not self.shared_secret:
+            return True
+        return msg.get('room_hash') == self.room_hash
 
     def _udp_listener(self):
         while self.running:
@@ -569,16 +574,17 @@ class NetworkCore(QObject):
                 safe_close(sock)
 
     def _send_identity(self, sock):
-        identity = json.dumps({'machine_id': MY_MACHINE_ID, 'nickname': self.nickname, 'room_hash': self.room_hash})
+        identity = json.dumps({'type': 'identity', 'machine_id': MY_MACHINE_ID, 'nickname': self.nickname})
         self._send_frame(sock, identity)
 
     def _chat_server_loop(self):
         while self.running:
             try:
                 client_sock, addr = self.chat_server_sock.accept()
-                if len(self.connections) >= MAX_CONNECTIONS:
-                    safe_close(client_sock)
-                    continue
+                with self.lock:
+                    if len(self.connections) >= MAX_CONNECTIONS:
+                        safe_close(client_sock)
+                        continue
                 identity = self._recv_frame(client_sock)
                 if not identity:
                     safe_close(client_sock)
@@ -588,14 +594,17 @@ class NetworkCore(QObject):
                 except:
                     safe_close(client_sock)
                     continue
-                if not self._validate_message(data):
-                    safe_close(client_sock)
-                    continue
-                if self.shared_secret and data.get('room_hash') != self.room_hash:
-                    safe_close(client_sock)
-                    continue
-                peer_id = data['machine_id']
-                peer_nick = data['nickname']
+                # identity не валидируется так же строго, как обычные сообщения
+                if data.get('type') == 'identity':
+                    peer_id = data['machine_id']
+                    peer_nick = data['nickname']
+                else:
+                    # на случай если это не identity, пробуем обычную валидацию
+                    if not self._validate_message(data):
+                        safe_close(client_sock)
+                        continue
+                    peer_id = data['machine_id']
+                    peer_nick = data.get('nickname', 'Unknown')
                 with self.lock:
                     self.connections[peer_id] = client_sock
                     if peer_id not in self.peers:
@@ -714,7 +723,7 @@ class NetworkCore(QObject):
         })
         try:
             self._send_frame(sock, msg)
-            QTimer.singleShot(60000, lambda rid=request_id: self._cleanup_offer(rid))
+            threading.Timer(60.0, lambda rid=request_id: self._cleanup_offer(rid)).start()
             return True
         except:
             with self.lock:
@@ -945,6 +954,10 @@ class ChatDisplay(QTextEdit):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
     def dropEvent(self, event: QDropEvent):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
@@ -995,7 +1008,6 @@ class SettingsDialog(QDialog):
         self.download_path.setReadOnly(True)
         browse_btn = QPushButton("Обзор...")
         browse_btn.clicked.connect(self.browse_download_path)
-
         self.shared_secret = QLineEdit()
         self.shared_secret.setEchoMode(QLineEdit.Password)
 
@@ -1097,7 +1109,12 @@ class MainWindow(QMainWindow):
         self.unread_counts = defaultdict(int)
         self.history_offset = {}
 
-        self.net = NetworkCore(db, nickname, broad_port, chat_port, file_port)
+        try:
+            self.net = NetworkCore(db, nickname, broad_port, chat_port, file_port)
+        except Exception as e:
+            QMessageBox.critical(self, "Критическая ошибка", f"Не удалось запустить сеть:\n{e}")
+            sys.exit(1)
+
         self.net.contact_update.connect(self.update_contacts)
         self.net.message_received.connect(self.display_message)
         self.net.file_request_received.connect(self.handle_incoming_file)
@@ -1141,14 +1158,12 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
 
-        # Вкладка Чаты
         chat_tab = QWidget()
         chat_layout = QHBoxLayout(chat_tab)
 
         splitter = QSplitter(Qt.Horizontal)
         chat_layout.addWidget(splitter)
 
-        # Левая панель контактов
         contact_panel = QWidget()
         contact_layout = QVBoxLayout(contact_panel)
         self.contact_filter = QLineEdit()
@@ -1168,7 +1183,6 @@ class MainWindow(QMainWindow):
         contact_layout.addWidget(self.back_btn)
         splitter.addWidget(contact_panel)
 
-        # Правая панель (стек чат/поиск)
         self.stack = QStackedWidget()
         chat_page = QWidget()
         chat_page_layout = QVBoxLayout(chat_page)
@@ -1222,13 +1236,20 @@ class MainWindow(QMainWindow):
         splitter.setSizes([220, 680])
 
         self.tabs.addTab(chat_tab, "Чаты")
-
-        # Вкладка Диагностика
         self.diag_widget = DiagnosticsWidget(self.net)
         self.tabs.addTab(self.diag_widget, "🩺 Диагностика")
 
     def _load_contacts(self):
-        pass
+        contacts = self.db.get_all_contacts()
+        for machine_id, nickname in contacts:
+            if machine_id != MY_MACHINE_ID:
+                item = QListWidgetItem(f"🖥 {html.escape(nickname)}")
+                item.setData(Qt.UserRole, machine_id)
+                self.contact_list.addItem(item)
+        unread = self.db.get_all_unread()
+        for mid, count in unread.items():
+            self.unread_counts[mid] = count
+        self._update_contact_display()
 
     def update_contacts(self, peers):
         current = self.contact_list.currentItem()
@@ -1237,9 +1258,10 @@ class MainWindow(QMainWindow):
         online = []
         offline = []
         now = time.time()
-        for mid, (ips, nick, last_hello, _, _) in peers.items():
+        for mid, (ips, nick, last_hello, _) in peers.items():
+            safe_nick = html.escape(nick)
             unread = self.unread_counts.get(mid, 0)
-            display = f"🖥 {nick}"
+            display = f"🖥 {safe_nick}"
             if unread > 0:
                 display += f"  ({unread})"
             if last_hello > 0 and now - last_hello < 20:
@@ -1292,12 +1314,18 @@ class MainWindow(QMainWindow):
     def _append_message(self, row):
         msg_id, sender_id, sender_name, message, file_name, file_path, is_folder, timestamp = row
         time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
+        safe_sender = html.escape(sender_name)
         if file_name:
-            link = f"mestochat://open_file?path={file_path}"
+            safe_file = html.escape(file_name)
+            link = f"mestochat://open_file?path={quote(file_path)}"
             icon = "📁" if is_folder else "📄"
-            self.chat_display.append(f"<b>[{time_str}] {sender_name}:</b> <a href='{link}'>{icon} {file_name}</a>")
+            self.chat_display.append(
+                f"<b>[{time_str}] {safe_sender}:</b> "
+                f"<a href='{html.escape(link)}'>{icon} {safe_file}</a>"
+            )
         else:
-            self.chat_display.append(f"<b>[{time_str}] {sender_name}:</b> {message}")
+            safe_msg = html.escape(message)
+            self.chat_display.append(f"<b>[{time_str}] {safe_sender}:</b> {safe_msg}")
 
     def load_more_history(self):
         if not self.current_peer:
@@ -1327,24 +1355,28 @@ class MainWindow(QMainWindow):
         self.history_offset[self.current_peer] = older[0][0]
 
     def display_message(self, sender_id, nick, text, file_name, local_path, is_folder):
+        safe_nick = html.escape(nick)
         if self.current_peer != sender_id or not self.isActiveWindow():
             self.unread_counts[sender_id] = self.unread_counts.get(sender_id, 0) + 1
             self._update_contact_display()
             if not self.isActiveWindow():
                 self.tray_icon.showMessage(
-                    f"Новое сообщение от {nick}",
-                    text if text else f"Файл: {file_name}",
+                    f"Новое сообщение от {safe_nick}",
+                    html.escape(text) if text else f"Файл: {html.escape(file_name)}",
                     QSystemTrayIcon.Information,
                     3000
                 )
         if self.current_peer == sender_id and self.stack.currentIndex() == 0:
             time_str = datetime.now().strftime("%H:%M")
             if file_name:
-                link = f"mestochat://open_file?path={local_path}"
+                link = f"mestochat://open_file?path={quote(local_path)}"
                 icon = "📁" if is_folder else "📄"
-                self.chat_display.append(f"<b>[{time_str}] {nick}:</b> <a href='{link}'>{icon} {file_name}</a>")
+                self.chat_display.append(
+                    f"<b>[{time_str}] {safe_nick}:</b> "
+                    f"<a href='{html.escape(link)}'>{icon} {html.escape(file_name)}</a>"
+                )
             else:
-                self.chat_display.append(f"<b>[{time_str}] {nick}:</b> {text}")
+                self.chat_display.append(f"<b>[{time_str}] {safe_nick}:</b> {html.escape(text)}")
             self.chat_display.moveCursor(QTextCursor.End)
 
     def _on_anchor_clicked(self, url):
@@ -1376,7 +1408,7 @@ class MainWindow(QMainWindow):
             return
         if self.net.send_message(self.current_peer, text):
             time_str = datetime.now().strftime("%H:%M")
-            self.chat_display.append(f"<b>[{time_str}] Вы:</b> {text}")
+            self.chat_display.append(f"<b>[{time_str}] Вы:</b> {html.escape(text)}")
             self.message_input.clear()
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не доставлено (сохранено для отправки)</i>")
@@ -1395,14 +1427,14 @@ class MainWindow(QMainWindow):
             return
         is_folder = file_path.lower().endswith('.zip') and file_path.startswith(tempfile.gettempdir())
         if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
-            self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {os.path.basename(file_path)}</i>")
+            self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {html.escape(os.path.basename(file_path))}</i>")
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не удалось предложить файл (контакт офлайн?)</i>")
 
     def offer_file(self, file_path):
         is_folder = file_path.lower().endswith('.zip') and file_path.startswith(tempfile.gettempdir())
         if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
-            self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {os.path.basename(file_path)}</i>")
+            self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {html.escape(os.path.basename(file_path))}</i>")
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не удалось предложить файл (контакт офлайн?)</i>")
 
@@ -1411,7 +1443,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "Входящий файл",
-            f"{nick} хочет передать {item_type}:\n{file_name} ({file_size} байт)\n\nПринять?",
+            f"{html.escape(nick)} хочет передать {item_type}:\n{html.escape(file_name)} ({file_size} байт)\n\nПринять?",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
@@ -1435,19 +1467,19 @@ class MainWindow(QMainWindow):
 
     def on_file_transfer_failed(self, peer_id, error_msg):
         if self.current_peer == peer_id and self.stack.currentIndex() == 0:
-            self.chat_display.append(f"<i style='color:red'>⚠ {error_msg}</i>")
+            self.chat_display.append(f"<i style='color:red'>⚠ {html.escape(error_msg)}</i>")
         else:
-            QMessageBox.warning(self, "Ошибка передачи файла", error_msg)
+            QMessageBox.warning(self, "Ошибка передачи файла", html.escape(error_msg))
 
     def search_messages(self):
         query = self.search_input.text().strip()
         if query:
             results = self.db.search_messages(query)
             self.search_display.clear()
-            self.search_display.append(f"Результаты поиска: {query}")
+            self.search_display.append(f"Результаты поиска: {html.escape(query)}")
             for sender_name, message, timestamp in results:
                 time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
-                self.search_display.append(f"<b>[{time_str}] {sender_name}:</b> {message}")
+                self.search_display.append(f"<b>[{time_str}] {html.escape(sender_name)}:</b> {html.escape(message)}")
             self.stack.setCurrentIndex(1)
             self.back_btn.show()
 
@@ -1476,7 +1508,7 @@ class MainWindow(QMainWindow):
             new_nick = new_nick.strip()
             if new_nick != self.nickname:
                 self.nickname = new_nick
-                self.setWindowTitle(f"MestoChat — {new_nick}")
+                self.setWindowTitle(f"MestoChat — {html.escape(new_nick)}")
                 self.net.update_nickname(new_nick)
 
     def open_settings(self):
