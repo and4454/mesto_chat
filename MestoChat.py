@@ -1,3 +1,4 @@
+```python
 import sys, os, socket, threading, json, time, struct, uuid, random, logging, zipfile, tempfile, shutil, sqlite3, hashlib, html
 from datetime import datetime
 from collections import defaultdict
@@ -11,32 +12,28 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton,
     QLabel, QMessageBox, QFileDialog, QSplitter, QSystemTrayIcon, QMenu, QAction,
     QDialog, QFormLayout, QDialogButtonBox, QStyle, QStackedWidget, QInputDialog,
-    QTabWidget, QSpinBox
+    QSpinBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QUrl
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QTextCursor, QDesktopServices, QPixmap, QDragMoveEvent
+from PyQt5.QtGui import QFont, QDragEnterEvent, QDropEvent, QTextCursor, QDesktopServices, QPixmap, QDragMoveEvent
 
-# ====================== CONFIG CONSTANTS ======================
+# ====================== КОНСТАНТЫ ======================
 BUFFER_SIZE = 8192
 UDP_BUFFER_SIZE = 4096
 MAX_MESSAGE_SIZE = 10 * 1024 * 1024
-FILE_CHUNK_SIZE = 65536
 MAX_PREAMBLE_SIZE = 128
 MAX_HEADER_SIZE = 512
 
 HEARTBEAT_INTERVAL = 3
 HEARTBEAT_TIMEOUT = 9
-PEER_TIMEOUT = 20  # seconds without hello to consider offline
+PEER_TIMEOUT = 20  # секунд без HELLO, чтобы считать офлайн
 RECONNECT_BACKOFF_MAX = 30
 MAX_RECONNECT_ATTEMPTS = 5
 
-DB_TIMEOUT = 5
-DB_RETRIES = 5
+TRANSFER_TIMEOUT = 30
+TRANSFER_PROGRESS_TIMEOUT = 10
 
-TRANSFER_TIMEOUT = 30  # seconds for whole transfer
-TRANSFER_PROGRESS_TIMEOUT = 10  # seconds without progress
-
-# ====================== CONFIGURATION LOADER ======================
+# ====================== КОНФИГУРАЦИЯ ======================
 DATA_DIR = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), 'MestoChat')
 os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
@@ -92,7 +89,7 @@ else:
         machine_id = f.read().strip()
 MY_MACHINE_ID: str = machine_id
 
-# ====================== NETWORK UTILS ======================
+# ====================== СЕТЕВЫЕ УТИЛИТЫ ======================
 def get_free_port(start: int = 50000, end: int = 50100) -> int:
     for port in range(start, end):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -140,7 +137,7 @@ def safe_close_socket(sock: Optional[socket.socket]) -> None:
     except Exception:
         logger.exception("Error closing socket")
 
-# ====================== DATABASE ======================
+# ====================== БАЗА ДАННЫХ ======================
 class ChatDatabase:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self._lock = threading.RLock()
@@ -151,7 +148,7 @@ class ChatDatabase:
         self._cleanup_old_messages()
         self._cleanup_temp_files()
 
-    def _retry_execute(self, func, max_retries: int = DB_RETRIES) -> Optional[Any]:
+    def _retry_execute(self, func, max_retries: int = 5) -> Optional[Any]:
         for i in range(max_retries):
             try:
                 return func()
@@ -220,7 +217,7 @@ class ChatDatabase:
         self._retry_execute(_do)
 
     def _cleanup_temp_files(self) -> None:
-        """Remove stale temporary archives and failed downloads."""
+        """Удаляет устаревшие временные архивы."""
         temp_dir = tempfile.gettempdir()
         try:
             for fname in os.listdir(temp_dir):
@@ -374,7 +371,7 @@ class ChatDatabase:
             cur.execute("UPDATE messages SET pending=0 WHERE id=?", (msg_id,))
             self.conn.commit()
 
-# ====================== NETWORK CORE ======================
+# ====================== СЕТЕВОЙ ДВИЖОК ======================
 executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="Mesto")
 MAX_CONNECTIONS = 20
 
@@ -395,6 +392,7 @@ class NetworkCore(QObject):
     file_request_received = pyqtSignal(str, str, str, int, str, bool)
     network_error = pyqtSignal(str)
     file_transfer_failed = pyqtSignal(str, str)
+    file_transfer_succeeded = pyqtSignal(str, str)  # peer_id, file_name
     file_progress = pyqtSignal(str, int, int)
     connection_state_changed = pyqtSignal(str, bool)
     reconnect_requested = pyqtSignal(str)
@@ -418,7 +416,6 @@ class NetworkCore(QObject):
         self.last_pong: Dict[str, float] = {}
         self.reconnect_attempts: Dict[str, int] = defaultdict(int)
         self.reconnecting: Dict[str, bool] = defaultdict(lambda: False)
-
         self.threads: List[threading.Thread] = []
 
         try:
@@ -432,20 +429,17 @@ class NetworkCore(QObject):
 
     def _init_sockets(self) -> None:
         try:
-            # UDP
             self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.udp_sock.bind(('', self.broadcast_port))
             self.udp_sock.settimeout(1.0)
 
-            # TCP chat
             self.chat_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.chat_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.chat_server_sock.bind(('0.0.0.0', self.chat_port))
             self.chat_server_sock.listen(5)
             self.chat_server_sock.settimeout(1.0)
 
-            # TCP files
             self.file_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.file_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.file_server_sock.bind(('0.0.0.0', self.file_port))
@@ -466,31 +460,23 @@ class NetworkCore(QObject):
             self.threads.append(t)
 
     def shutdown(self) -> None:
-        """Centralized shutdown sequence."""
         logger.info("Shutting down network core")
         self.running = False
-
-        # 1. Close all listening sockets to unblock threads
         safe_close_socket(self.udp_sock)
         safe_close_socket(self.chat_server_sock)
         safe_close_socket(self.file_server_sock)
-
-        # 2. Close peer connections
         with self.state_lock:
             for sock in list(self.connections.values()):
                 safe_close_socket(sock)
             self.connections.clear()
-
-        # 3. Join threads with timeout
         for t in self.threads:
             if t.is_alive():
                 t.join(timeout=2)
             if t.is_alive():
                 logger.warning(f"Thread {t.name} did not terminate")
-
         logger.info("Shutdown complete")
 
-    # -------- UDP DISCOVERY --------
+    # ----- UDP DISCOVERY -----
     def _send_hello(self) -> None:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -531,10 +517,8 @@ class NetworkCore(QObject):
         except Exception:
             logger.exception("Unexpected UDP parsing error")
             return
-
         if not self._validate_message(msg):
             return
-
         msg_type = msg.get('type')
         if msg_type == 'HELLO':
             self._handle_hello_packet(msg, addr)
@@ -553,7 +537,6 @@ class NetworkCore(QObject):
         peer_chat_port = msg.get('chat_port', self.chat_port)
         peer_file_port = msg.get('file_port', self.file_port)
         peer_ips = msg.get('ips', [addr[0]])
-
         with self.state_lock:
             if peer_id in self.peers:
                 old_ips = set(self.peers[peer_id][0])
@@ -562,7 +545,6 @@ class NetworkCore(QObject):
                     logger.warning(f"Machine {peer_id} ({peer_nick}) changed IP from {old_ips} to {new_ips}")
             self.peers[peer_id] = (peer_ips, peer_nick, time.time(), peer_chat_port, peer_file_port)
             self.last_pong[peer_id] = time.time()
-
         self.db.add_contact(peer_id, peer_nick)
         self._merge_contacts()
         if peer_id not in self.connections:
@@ -581,7 +563,7 @@ class NetworkCore(QObject):
             with self.state_lock:
                 self.last_pong[peer_id] = time.time()
 
-    # -------- HEARTBEAT --------
+    # ----- HEARTBEAT -----
     def _heartbeat_loop(self) -> None:
         while self.running:
             time.sleep(config.get('heartbeat_interval', HEARTBEAT_INTERVAL))
@@ -595,7 +577,6 @@ class NetworkCore(QObject):
                 logger.exception("PING broadcast failed")
             finally:
                 sock.close()
-
             timeout = config.get('heartbeat_timeout', HEARTBEAT_TIMEOUT)
             with self.state_lock:
                 for peer_id in list(self.connections.keys()):
@@ -608,11 +589,10 @@ class NetworkCore(QObject):
                         self.reconnect_requested.emit(peer_id)
             self._merge_contacts()
 
-    # -------- CONNECTION MANAGEMENT --------
+    # ----- CONNECTION MANAGEMENT -----
     def _merge_contacts(self) -> None:
         db_contacts = {mid: nick for mid, nick in self.db.get_all_contacts() if mid != MY_MACHINE_ID}
         combined = {}
-        now = time.time()
         with self.state_lock:
             peers_snapshot = dict(self.peers)
         for mid, nick in db_contacts.items():
@@ -632,18 +612,16 @@ class NetworkCore(QObject):
             sock.settimeout(2.0)
             try:
                 sock.connect((ip, chat_port))
-            except Exception as e:
-                logger.warning(f"Connect to {ip}:{chat_port} failed: {e}")
+            except Exception:
+                logger.warning(f"Connect to {ip}:{chat_port} failed")
                 safe_close_socket(sock)
                 continue
-
             with self.state_lock:
                 if peer_id in self.connections:
                     safe_close_socket(sock)
                     return
                 self.connections[peer_id] = sock
                 self.last_pong[peer_id] = time.time()
-
             sock.settimeout(30)
             executor.submit(self._chat_receiver, sock, peer_id)
             self._send_identity(sock)
@@ -669,10 +647,8 @@ class NetworkCore(QObject):
             if peer_id not in self.peers:
                 return
             ips, _, _, chat_port, _ = self.peers[peer_id]
-
-        logger.info(f"Reconnecting to {peer_id} ({ips}:{chat_port})")
+        logger.info(f"Reconnecting to {peer_id}")
         self._try_connect_to_peer(peer_id, ips, chat_port)
-
         with self.state_lock:
             if peer_id in self.connections:
                 self.reconnect_attempts[peer_id] = 0
@@ -682,7 +658,7 @@ class NetworkCore(QObject):
                     self.reconnect_requested.emit(peer_id)
             self.reconnecting[peer_id] = False
 
-    # -------- CHAT SERVER --------
+    # ----- CHAT SERVER -----
     def _chat_server_loop(self) -> None:
         while self.running:
             try:
@@ -713,13 +689,12 @@ class NetworkCore(QObject):
             safe_close_socket(client_sock)
             return
         except Exception:
-            logger.exception("Unexpected identity parsing error")
+            logger.exception("Identity parsing error")
             safe_close_socket(client_sock)
             return
-
         if data.get('type') == 'identity':
             if self.room_hash and data.get('room_hash') != self.room_hash:
-                logger.warning("Connection rejected: room_hash mismatch")
+                logger.warning("Room hash mismatch")
                 safe_close_socket(client_sock)
                 return
             peer_id = data['machine_id']
@@ -730,7 +705,6 @@ class NetworkCore(QObject):
                 return
             peer_id = data['machine_id']
             peer_nick = data.get('nickname', 'Unknown')
-
         with self.state_lock:
             if peer_id in self.connections:
                 safe_close_socket(client_sock)
@@ -742,7 +716,6 @@ class NetworkCore(QObject):
                 ips, _, _, _, _ = self.peers[peer_id]
                 self.peers[peer_id] = (ips, peer_nick, time.time(), self.chat_port, self.file_port)
             self.last_pong[peer_id] = time.time()
-
         self._merge_contacts()
         executor.submit(self._chat_receiver, client_sock, peer_id)
         self._send_pending_messages(peer_id)
@@ -761,7 +734,6 @@ class NetworkCore(QObject):
                 except Exception:
                     logger.exception("Chat receiver parsing error")
                     continue
-
                 if not self._validate_message(data):
                     continue
                 self._process_message(peer_id, data)
@@ -772,7 +744,6 @@ class NetworkCore(QObject):
             except Exception:
                 logger.exception(f"Chat receiver error for {peer_id}")
                 break
-
         with self.state_lock:
             if peer_id in self.connections and self.connections[peer_id] == sock:
                 del self.connections[peer_id]
@@ -788,12 +759,10 @@ class NetworkCore(QObject):
         elif msg_type == 'file_request':
             self._handle_file_request_message(peer_id, data)
         elif msg_type == 'file_accept':
-            request_id = data['request_id']
-            self._send_file_to(peer_id, request_id)
+            self._send_file_to(peer_id, data['request_id'])
         elif msg_type == 'file_reject':
-            request_id = data['request_id']
             with self.state_lock:
-                self.offered_files.pop(request_id, None)
+                self.offered_files.pop(data['request_id'], None)
         elif msg_type == 'nickname_change':
             self._handle_nickname_change(peer_id, data)
 
@@ -805,12 +774,8 @@ class NetworkCore(QObject):
         self.message_received.emit(peer_id, sender_nick, message, '', '', False)
 
     def _handle_file_request_message(self, peer_id: str, data: dict) -> None:
-        file_name = data['file_name']
-        file_size = data['file_size']
-        request_id = data['request_id']
-        is_folder = data.get('is_folder', False)
         sender_nick = self.peers.get(peer_id, ('', 'Unknown'))[1]
-        self.file_request_received.emit(peer_id, sender_nick, file_name, file_size, request_id, is_folder)
+        self.file_request_received.emit(peer_id, sender_nick, data['file_name'], data['file_size'], data['request_id'], data.get('is_folder', False))
 
     def _handle_nickname_change(self, peer_id: str, data: dict) -> None:
         new_nick = data['new_nick']
@@ -821,7 +786,7 @@ class NetworkCore(QObject):
         self.db.add_contact(peer_id, new_nick)
         self._merge_contacts()
 
-    # -------- MESSAGING --------
+    # ----- MESSAGING -----
     def send_message(self, peer_id: str, text: str) -> bool:
         with self.state_lock:
             sock = self.connections.get(peer_id)
@@ -884,7 +849,7 @@ class NetworkCore(QObject):
         with self.state_lock:
             self.offered_files.pop(request_id, None)
 
-    # -------- FILE TRANSFER --------
+    # ----- FILE TRANSFER -----
     def _send_file_to(self, receiver_id: str, request_id: str) -> None:
         with self.state_lock:
             info = self.offered_files.pop(request_id, None)
@@ -919,13 +884,13 @@ class NetworkCore(QObject):
             self._send_exact(file_sock, preamble.encode().ljust(MAX_PREAMBLE_SIZE))
             header = json.dumps({'file_name': os.path.basename(file_path), 'file_size': os.path.getsize(file_path)})
             self._send_exact(file_sock, header.encode().ljust(MAX_HEADER_SIZE))
-
             with open(file_path, 'rb') as f:
                 while chunk := f.read(BUFFER_SIZE):
                     file_sock.sendall(chunk)
+            self.file_transfer_succeeded.emit(receiver_id, os.path.basename(file_path))
         except Exception:
             logger.exception(f"File send error to {receiver_id}")
-            self.file_transfer_failed.emit(receiver_id, f"Ошибка при отправке файла")
+            self.file_transfer_failed.emit(receiver_id, "Ошибка при отправке файла")
         finally:
             safe_close_socket(file_sock)
             if is_folder and file_path.startswith(tempfile.gettempdir()):
@@ -967,7 +932,6 @@ class NetworkCore(QObject):
             except Exception:
                 logger.exception("Error parsing file preamble")
                 return
-
             if not all(k in preamble for k in ('request_id', 'sender_id')):
                 logger.warning("Missing fields in preamble")
                 return
@@ -984,7 +948,6 @@ class NetworkCore(QObject):
             except Exception:
                 logger.exception("Error parsing file header")
                 return
-
             if not all(k in header for k in ('file_name', 'file_size')):
                 return
             file_name = header['file_name']
@@ -994,7 +957,6 @@ class NetworkCore(QObject):
             safe_name = "".join(c for c in file_name if c.isalnum() or c in "._- ")
             if not safe_name:
                 safe_name = "unnamed"
-
             if file_size > config['max_file_mb'] * 1024 * 1024:
                 return
 
@@ -1049,7 +1011,7 @@ class NetworkCore(QObject):
         finally:
             safe_close_socket(sock)
 
-    # -------- PROTOCOL HELPERS --------
+    # ----- PROTOCOL HELPERS -----
     def _send_frame(self, sock: socket.socket, plain: str) -> None:
         data = plain.encode()
         length = len(data)
@@ -1136,6 +1098,7 @@ class ChatDisplay(QTextEdit):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setReadOnly(True)
+        self.setFont(QFont("Segoe UI", 10))
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
     def _on_scroll(self, value: int) -> None:
@@ -1260,49 +1223,13 @@ class SettingsDialog(QDialog):
             os.makedirs(config['download_path'], exist_ok=True)
         self.accept()
 
-class DiagnosticsWidget(QWidget):
-    def __init__(self, net: NetworkCore, parent=None):
-        super().__init__(parent)
-        self.net = net
-        layout = QVBoxLayout()
-        self.info_label = QLabel()
-        layout.addWidget(self.info_label)
-        layout.addWidget(QLabel("Последние записи лога:"))
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        layout.addWidget(self.log_text)
-        self.refresh_btn = QPushButton("Обновить")
-        self.refresh_btn.clicked.connect(self.refresh)
-        layout.addWidget(self.refresh_btn)
-        self.setLayout(layout)
-        self.refresh()
-
-    def refresh(self) -> None:
-        info = (
-            f"Мой IP: {self.net.local_ips}\n"
-            f"Broadcast порт: {self.net.broadcast_port}\n"
-            f"Чат порт: {self.net.chat_port}\n"
-            f"Файловый порт: {self.net.file_port}\n"
-            f"Пиров онлайн: {sum(1 for p in self.net.peers.values() if time.time()-p[2]<20)}\n"
-            f"Всего пиров: {len(self.net.peers)}\n"
-            f"Активных TCP-соединений: {len(self.net.connections)}\n"
-            f"Попыток переподключения: {len(self.net.reconnect_attempts)}"
-        )
-        self.info_label.setText(info)
-        try:
-            with open(LOG_PATH, 'r') as f:
-                lines = f.readlines()[-30:]
-                self.log_text.setPlainText(''.join(lines))
-        except Exception:
-            pass
-
 class MainWindow(QMainWindow):
     def __init__(self, db: ChatDatabase, nickname: str, broad_port: int, chat_port: int, file_port: int):
         super().__init__()
         self.db = db
         self.nickname = nickname
         self.setWindowTitle(f"MestoChat — {html.escape(nickname)}")
-        self.setMinimumSize(900, 600)
+        self.setMinimumSize(800, 500)
         self.current_peer: Optional[str] = None
         self.unread_counts: Dict[str, int] = defaultdict(int)
         self.history_offset: Dict[str, Optional[int]] = {}
@@ -1330,6 +1257,7 @@ class MainWindow(QMainWindow):
         self.net.file_request_received.connect(self.handle_incoming_file)
         self.net.network_error.connect(self.show_error)
         self.net.file_transfer_failed.connect(self.on_file_transfer_failed)
+        self.net.file_transfer_succeeded.connect(self.on_file_transfer_succeeded)
         self.net.reconnect_requested.connect(self.schedule_reconnect)
 
         self._setup_ui()
@@ -1346,6 +1274,10 @@ class MainWindow(QMainWindow):
         show_action = QAction("Открыть", self)
         show_action.triggered.connect(self.show)
         tray_menu.addAction(show_action)
+        settings_action = QAction("Настройки", self)
+        settings_action.triggered.connect(self.open_settings)
+        tray_menu.addAction(settings_action)
+        tray_menu.addSeparator()
         quit_action = QAction("Выйти", self)
         quit_action.triggered.connect(self.full_quit)
         tray_menu.addAction(quit_action)
@@ -1364,154 +1296,148 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
-
-        chat_tab = QWidget()
-        chat_layout = QHBoxLayout(chat_tab)
+        self.net_status_label = QLabel("LAN Chat — 0 online 🟢 stable")
+        self.net_status_label.setAlignment(Qt.AlignCenter)
+        self.net_status_label.setStyleSheet("background-color: #1e1e1e; color: #aaa; padding: 2px; font-size: 9pt;")
+        main_layout.addWidget(self.net_status_label)
 
         splitter = QSplitter(Qt.Horizontal)
-        chat_layout.addWidget(splitter)
+        main_layout.addWidget(splitter)
 
-        contact_panel = QWidget()
-        contact_layout = QVBoxLayout(contact_panel)
-        self.contact_filter = QLineEdit()
-        self.contact_filter.setPlaceholderText("Поиск контакта...")
-        self.contact_filter.textChanged.connect(self.filter_contacts)
-        contact_layout.addWidget(self.contact_filter)
+        # ----- ЛЕВАЯ ПАНЕЛЬ: КОНТАКТЫ -----
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         self.contact_list = QListWidget()
+        self.contact_list.setFont(QFont("Segoe UI", 10))
+        self.contact_list.setStyleSheet("""
+            QListWidget {
+                background-color: #252526;
+                color: #cccccc;
+                border: none;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #3e3e42;
+            }
+            QListWidget::item:selected {
+                background-color: #094771;
+                color: white;
+            }
+        """)
         self.contact_list.itemClicked.connect(self.on_contact_clicked)
-        contact_layout.addWidget(self.contact_list)
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Поиск сообщений...")
-        self.search_input.returnPressed.connect(self.search_messages)
-        contact_layout.addWidget(self.search_input)
-        self.back_btn = QPushButton("← Назад к чату")
-        self.back_btn.clicked.connect(self.return_to_chat)
-        self.back_btn.hide()
-        contact_layout.addWidget(self.back_btn)
-        splitter.addWidget(contact_panel)
+        left_layout.addWidget(self.contact_list)
+        splitter.addWidget(left_panel)
 
-        self.stack = QStackedWidget()
-        chat_page = QWidget()
-        chat_page_layout = QVBoxLayout(chat_page)
+        # ----- ПРАВАЯ ПАНЕЛЬ: ЧАТ -----
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
         self.chat_display = ChatDisplay()
+        self.chat_display.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border: none;")
         self.chat_display.file_dropped.connect(self.on_file_dropped)
         self.chat_display.history_scroll.connect(self.load_more_history)
         self.chat_display.anchorClicked.connect(self._on_anchor_clicked)
-        chat_page_layout.addWidget(self.chat_display)
+        right_layout.addWidget(self.chat_display)
 
         input_layout = QHBoxLayout()
         self.message_input = QLineEdit()
-        self.message_input.setPlaceholderText("Сообщение...")
+        self.message_input.setPlaceholderText("Введите сообщение...")
+        self.message_input.setStyleSheet("background-color: #3c3c3c; color: white; border: none; padding: 8px;")
         self.message_input.returnPressed.connect(self.send_message)
         input_layout.addWidget(self.message_input)
 
-        send_btn = QPushButton("Отправить")
+        send_btn = QPushButton("⬆")
+        send_btn.setFixedWidth(40)
+        send_btn.setStyleSheet("background-color: #007acc; color: white; border: none; font-weight: bold;")
         send_btn.clicked.connect(self.send_message)
         input_layout.addWidget(send_btn)
 
-        file_btn = QPushButton("📎 Файлы")
-        file_btn.clicked.connect(self.select_and_send_files)
-        input_layout.addWidget(file_btn)
-
-        export_btn = QPushButton("💾 Сохранить чат")
-        export_btn.clicked.connect(self.export_chat)
-        input_layout.addWidget(export_btn)
-
-        open_folder_btn = QPushButton("📂 Файлы")
-        open_folder_btn.clicked.connect(self.open_downloads_folder)
-        input_layout.addWidget(open_folder_btn)
-
-        nick_btn = QPushButton("✏️ Ник")
-        nick_btn.clicked.connect(self.change_nickname)
-        input_layout.addWidget(nick_btn)
-
-        settings_btn = QPushButton("⚙️ Настройки")
-        settings_btn.clicked.connect(self.open_settings)
-        input_layout.addWidget(settings_btn)
-
-        chat_page_layout.addLayout(input_layout)
-        self.stack.addWidget(chat_page)
-
-        search_page = QWidget()
-        search_layout = QVBoxLayout(search_page)
-        self.search_display = QTextEdit()
-        self.search_display.setReadOnly(True)
-        search_layout.addWidget(self.search_display)
-        self.stack.addWidget(search_page)
-
-        splitter.addWidget(self.stack)
-        splitter.setSizes([220, 680])
-
-        self.tabs.addTab(chat_tab, "Чаты")
-        self.diag_widget = DiagnosticsWidget(self.net)
-        self.tabs.addTab(self.diag_widget, "🩺 Диагностика")
+        right_layout.addLayout(input_layout)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([200, 600])
 
     def _load_contacts(self) -> None:
         contacts = self.db.get_all_contacts()
         for machine_id, nickname in contacts:
             if machine_id != MY_MACHINE_ID:
-                item = QListWidgetItem(f"🖥 {html.escape(nickname)}")
-                item.setData(Qt.UserRole, machine_id)
-                self.contact_list.addItem(item)
+                self._add_contact_entry(machine_id, nickname)
         unread = self.db.get_all_unread()
         for mid, count in unread.items():
             self.unread_counts[mid] = count
-        self._update_contact_display()
+
+    def _add_contact_entry(self, machine_id: str, nickname: str) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, machine_id)
+        self.contact_list.addItem(item)
 
     def update_contacts(self, peers: dict) -> None:
         current = self.contact_list.currentItem()
         current_id = current.data(Qt.UserRole) if current else None
         self.contact_list.clear()
         online = []
+        reconnecting = []
         offline = []
         now = time.time()
-        for mid, (ips, nick, last_hello, _) in peers.items():
-            safe_nick = html.escape(nick)
-            unread = self.unread_counts.get(mid, 0)
-            display = f"🖥 {safe_nick}"
-            if unread > 0:
-                display += f"  ({unread})"
-            if last_hello > 0 and now - last_hello < PEER_TIMEOUT:
-                online.append((mid, display))
+        for mid, (ips, nick, last_hello, _, _) in peers.items():
+            status = 'online' if (now - last_hello < PEER_TIMEOUT) else 'offline'
+            if self.net.reconnect_attempts.get(mid, 0) > 0:
+                status = 'reconnecting'
+            entry = (mid, nick, status)
+            if status == 'online':
+                online.append(entry)
+            elif status == 'reconnecting':
+                reconnecting.append(entry)
             else:
-                offline.append((mid, display))
+                offline.append(entry)
+
         online.sort(key=lambda x: x[1].lower())
+        reconnecting.sort(key=lambda x: x[1].lower())
         offline.sort(key=lambda x: x[1].lower())
-        for mid, display in online:
-            item = QListWidgetItem(f"🟢 {display}")
+
+        for mid, nick, status in online + reconnecting + offline:
+            icon = '🟢' if status == 'online' else ('🟡' if status == 'reconnecting' else '⚫')
+            text = f"{icon} {html.escape(nick)}"
+            unread = self.unread_counts.get(mid, 0)
+            if unread > 0:
+                text += f"  ({unread})"
+            item = QListWidgetItem(text)
             item.setData(Qt.UserRole, mid)
             self.contact_list.addItem(item)
-        for mid, display in offline:
-            item = QListWidgetItem(f"⚫ {display}")
-            item.setData(Qt.UserRole, mid)
-            self.contact_list.addItem(item)
+
         if current_id:
             for i in range(self.contact_list.count()):
                 if self.contact_list.item(i).data(Qt.UserRole) == current_id:
                     self.contact_list.setCurrentRow(i)
                     break
-        self.filter_contacts(self.contact_filter.text())
 
-    def filter_contacts(self, text: str) -> None:
-        for i in range(self.contact_list.count()):
-            item = self.contact_list.item(i)
-            if text.lower() in item.text().lower():
-                item.setHidden(False)
-            else:
-                item.setHidden(True)
+        online_count = len(online)
+        total = len(peers)
+        if total == 0:
+            status_text = "LAN Chat — waiting for peers..."
+            status_color = "#aaa"
+        elif online_count == total:
+            status_text = f"LAN Chat — {online_count} online 🟢 stable"
+            status_color = "#4caf50"
+        elif reconnecting:
+            status_text = f"LAN Chat — {online_count}/{total} online 🟡 unstable"
+            status_color = "#ff9800"
+        else:
+            status_text = f"LAN Chat — {online_count}/{total} online 🔴 degraded"
+            status_color = "#f44336"
+        self.net_status_label.setText(status_text)
+        self.net_status_label.setStyleSheet(f"background-color: #1e1e1e; color: {status_color}; padding: 2px; font-size: 9pt;")
 
     def on_contact_clicked(self, item: QListWidgetItem) -> None:
         self.current_peer = item.data(Qt.UserRole)
         self.history_offset[self.current_peer] = None
         self.load_chat_history(self.current_peer)
-        self.stack.setCurrentIndex(0)
-        self.back_btn.hide()
         self.db.clear_unread(self.current_peer)
         self.unread_counts[self.current_peer] = 0
-        self._update_contact_display()
+        self.message_input.setFocus()
 
     def load_chat_history(self, peer_id: str) -> None:
         self.chat_display.clear()
@@ -1520,6 +1446,7 @@ class MainWindow(QMainWindow):
             self._append_message(row)
         if messages:
             self.history_offset[peer_id] = messages[0][0]
+        self.chat_display.moveCursor(QTextCursor.End)
 
     def _append_message(self, row: tuple) -> None:
         msg_id, sender_id, sender_name, message, file_name, file_path, is_folder, timestamp = row
@@ -1549,7 +1476,6 @@ class MainWindow(QMainWindow):
         scrollbar = self.chat_display.verticalScrollBar()
         old_value = scrollbar.value()
         old_max = scrollbar.maximum()
-
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.Start)
         self.chat_display.setTextCursor(cursor)
@@ -1557,11 +1483,9 @@ class MainWindow(QMainWindow):
             self._append_message(row)
             cursor.movePosition(QTextCursor.Start)
             self.chat_display.setTextCursor(cursor)
-
         new_max = scrollbar.maximum()
         delta = new_max - old_max
         scrollbar.setValue(old_value + delta)
-
         self.history_offset[self.current_peer] = older[0][0]
 
     def display_message(self, sender_id: str, nick: str, text: str, file_name: str, local_path: str, is_folder: bool) -> None:
@@ -1576,7 +1500,7 @@ class MainWindow(QMainWindow):
                     QSystemTrayIcon.Information,
                     3000
                 )
-        if self.current_peer == sender_id and self.stack.currentIndex() == 0:
+        if self.current_peer == sender_id:
             time_str = datetime.now().strftime("%H:%M")
             if file_name:
                 link = f"mestochat://open_file?path={quote(local_path)}"
@@ -1623,28 +1547,14 @@ class MainWindow(QMainWindow):
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не доставлено (сохранено для отправки)</i>")
 
-    def select_and_send_files(self) -> None:
-        if not self.current_peer:
-            QMessageBox.warning(self, "Ошибка", "Выберите контакт.")
-            return
-        files, _ = QFileDialog.getOpenFileNames(self, "Выберите файлы", "", "Все файлы (*.*)")
-        for f in files:
-            self.offer_file(f, is_folder=False)
-
     def on_file_dropped(self, file_path: str, is_folder: bool) -> None:
         if not self.current_peer:
             QMessageBox.warning(self, "Ошибка", "Сначала выберите контакт в списке.")
             return
         if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
-            self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {html.escape(os.path.basename(file_path))}</i>")
+            self.chat_display.append(f"<b>Вы:</b> <i>Отправка файла: {html.escape(os.path.basename(file_path))}</i>")
         else:
-            self.chat_display.append("<i style='color:red'>⚠ Не удалось предложить файл (контакт офлайн?)</i>")
-
-    def offer_file(self, file_path: str, is_folder: bool = False) -> None:
-        if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
-            self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {html.escape(os.path.basename(file_path))}</i>")
-        else:
-            self.chat_display.append("<i style='color:red'>⚠ Не удалось предложить файл (контакт офлайн?)</i>")
+            self.chat_display.append("<i style='color:red'>⚠ Не удалось отправить файл</i>")
 
     def handle_incoming_file(self, sender_id: str, nick: str, file_name: str, file_size: int, request_id: str, is_folder: bool) -> None:
         item_type = "папку" if is_folder else "файл"
@@ -1674,55 +1584,18 @@ class MainWindow(QMainWindow):
                     logger.exception("Error sending file reject")
 
     def on_file_transfer_failed(self, peer_id: str, error_msg: str) -> None:
-        if self.current_peer == peer_id and self.stack.currentIndex() == 0:
-            self.chat_display.append(f"<i style='color:red'>⚠ {html.escape(error_msg)}</i>")
+        if self.current_peer == peer_id:
+            self.chat_display.append(f"<i style='color:red'>❌ {html.escape(error_msg)}</i>")
         else:
             QMessageBox.warning(self, "Ошибка передачи файла", html.escape(error_msg))
 
-    def search_messages(self) -> None:
-        query = self.search_input.text().strip()
-        if query:
-            results = self.db.search_messages(query)
-            self.search_display.clear()
-            self.search_display.append(f"Результаты поиска: {html.escape(query)}")
-            for sender_name, message, timestamp in results:
-                time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
-                self.search_display.append(f"<b>[{time_str}] {html.escape(sender_name)}:</b> {html.escape(message)}")
-            self.stack.setCurrentIndex(1)
-            self.back_btn.show()
-
-    def return_to_chat(self) -> None:
-        self.stack.setCurrentIndex(0)
-        self.back_btn.hide()
-        if self.current_peer:
-            self.load_chat_history(self.current_peer)
-
-    def export_chat(self) -> None:
-        if not self.current_peer:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Экспорт чата", f"chat_{self.current_peer}.txt", "Текстовые файлы (*.txt)")
-        if path:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(self.chat_display.toPlainText())
-            QMessageBox.information(self, "Готово", f"Чат сохранён в {path}")
-
-    def open_downloads_folder(self) -> None:
-        folder = config.get('download_path', DEFAULT_DOWNLOADS_DIR)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-
-    def change_nickname(self) -> None:
-        new_nick, ok = QInputDialog.getText(self, "Сменить ник", "Новый никнейм:", text=self.nickname)
-        if ok and new_nick.strip():
-            new_nick = new_nick.strip()
-            if new_nick != self.nickname:
-                self.nickname = new_nick
-                self.setWindowTitle(f"MestoChat — {html.escape(new_nick)}")
-                self.net.update_nickname(new_nick)
+    def on_file_transfer_succeeded(self, peer_id: str, file_name: str) -> None:
+        if self.current_peer == peer_id:
+            self.chat_display.append(f"<i style='color:green'>✔ Файл {html.escape(file_name)} отправлен</i>")
 
     def open_settings(self) -> None:
         dlg = SettingsDialog(self)
-        if dlg.exec_() == QDialog.Accepted:
-            QMessageBox.information(self, "Настройки", "Изменения вступят в силу после перезапуска программы.")
+        dlg.exec_()
 
     def show_error(self, msg: str) -> None:
         QMessageBox.critical(self, "Ошибка", msg)
@@ -1750,7 +1623,7 @@ class MainWindow(QMainWindow):
             mid = item.data(Qt.UserRole)
             if mid in self.unread_counts and self.unread_counts[mid] > 0:
                 base = item.text().split("  (")[0] if "  (" in item.text() else item.text()
-                if "🟢" in base or "⚫" in base:
+                if "🟢" in base or "🟡" in base or "⚫" in base:
                     item.setText(f"{base}  ({self.unread_counts[mid]})")
 
 if __name__ == "__main__":
@@ -1788,3 +1661,4 @@ if __name__ == "__main__":
         sys.exit(app.exec_())
     except Exception as e:
         QMessageBox.critical(None, "Ошибка запуска", str(e))
+```
