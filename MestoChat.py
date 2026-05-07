@@ -11,10 +11,10 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton,
     QLabel, QMessageBox, QFileDialog, QSplitter, QSystemTrayIcon, QMenu, QAction,
     QDialog, QFormLayout, QDialogButtonBox, QStyle, QStackedWidget, QInputDialog,
-    QSpinBox
+    QSpinBox, QComboBox, QCheckBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QUrl
-from PyQt5.QtGui import QFont, QDragEnterEvent, QDropEvent, QTextCursor, QDesktopServices, QPixmap, QDragMoveEvent
+from PyQt5.QtGui import QFont, QDragEnterEvent, QDropEvent, QTextCursor, QDesktopServices, QPixmap, QDragMoveEvent, QPalette, QColor
 
 # ====================== КОНСТАНТЫ ======================
 BUFFER_SIZE = 8192
@@ -25,7 +25,7 @@ MAX_HEADER_SIZE = 512
 
 HEARTBEAT_INTERVAL = 3
 HEARTBEAT_TIMEOUT = 9
-PEER_TIMEOUT = 20  # секунд без HELLO, чтобы считать офлайн
+PEER_TIMEOUT = 20
 RECONNECT_BACKOFF_MAX = 30
 MAX_RECONNECT_ATTEMPTS = 5
 
@@ -51,7 +51,11 @@ DEFAULT_CONFIG = {
     "heartbeat_interval": HEARTBEAT_INTERVAL,
     "heartbeat_timeout": HEARTBEAT_TIMEOUT,
     "download_path": DEFAULT_DOWNLOADS_DIR,
-    "shared_secret_hash": ""
+    "shared_secret_hash": "",
+    "auto_reconnect": True,
+    "discovery_on": True,
+    "theme": "dark",
+    "font_size": "medium"
 }
 
 def load_config() -> dict:
@@ -370,6 +374,9 @@ class ChatDatabase:
             cur.execute("UPDATE messages SET pending=0 WHERE id=?", (msg_id,))
             self.conn.commit()
 
+// конец первой части
+// начало второй части
+
 # ====================== СЕТЕВОЙ ДВИЖОК ======================
 executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="Mesto")
 MAX_CONNECTIONS = 20
@@ -391,14 +398,14 @@ class NetworkCore(QObject):
     file_request_received = pyqtSignal(str, str, str, int, str, bool)
     network_error = pyqtSignal(str)
     file_transfer_failed = pyqtSignal(str, str)
-    file_transfer_succeeded = pyqtSignal(str, str)  # peer_id, file_name
+    file_transfer_succeeded = pyqtSignal(str, str)
     file_progress = pyqtSignal(str, int, int)
     connection_state_changed = pyqtSignal(str, bool)
     reconnect_requested = pyqtSignal(str)
 
     def __init__(self, db: ChatDatabase, nickname: str,
                  broadcast_port: int, chat_port: int, file_port: int,
-                 room_hash: str = '') -> None:
+                 room_hash: str = '', auto_reconnect: bool = True, discovery_on: bool = True) -> None:
         super().__init__()
         self.db = db
         self.nickname = nickname
@@ -406,6 +413,8 @@ class NetworkCore(QObject):
         self.chat_port = chat_port
         self.file_port = file_port
         self.running = True
+        self.auto_reconnect = auto_reconnect
+        self.discovery_on = discovery_on
         self.local_ips = get_all_local_ips()
         self.state_lock = threading.RLock()
         self.room_hash = room_hash
@@ -419,7 +428,8 @@ class NetworkCore(QObject):
 
         try:
             self._init_sockets()
-            self._send_hello()
+            if self.discovery_on:
+                self._send_hello()
             self._start_threads()
             self._merge_contacts()
         except Exception:
@@ -637,6 +647,8 @@ class NetworkCore(QObject):
         self._send_frame(sock, identity)
 
     def _try_reconnect(self, peer_id: str) -> None:
+        if not self.auto_reconnect:
+            return
         with self.state_lock:
             if peer_id in self.connections or not self.running:
                 return
@@ -1088,6 +1100,9 @@ class NetworkCore(QObject):
                 if self._send_message_raw(peer_id, text):
                     self.db.mark_sent(msg_id)
 
+// конец второй части
+// начало третьей части
+
 # ====================== GUI ======================
 class ChatDisplay(QTextEdit):
     file_dropped = pyqtSignal(str, bool)
@@ -1150,76 +1165,41 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Настройки MestoChat")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(350)
         layout = QFormLayout()
-        self.bport = QSpinBox(); self.bport.setRange(0,65535)
-        self.cport = QSpinBox(); self.cport.setRange(0,65535)
-        self.fport = QSpinBox(); self.fport.setRange(0,65535)
-        self.max_mb = QSpinBox(); self.max_mb.setRange(10,2000)
-        self.history_days = QSpinBox(); self.history_days.setRange(0,3650)
-        self.key_path = QLineEdit()
-        self.heartbeat_int = QSpinBox(); self.heartbeat_int.setRange(1,30)
-        self.heartbeat_timeout = QSpinBox(); self.heartbeat_timeout.setRange(3,60)
-        self.download_path = QLineEdit()
-        self.download_path.setReadOnly(True)
-        browse_btn = QPushButton("Обзор...")
-        browse_btn.clicked.connect(self.browse_download_path)
-        self.shared_secret = QLineEdit()
-        self.shared_secret.setEchoMode(QLineEdit.Password)
 
-        self.load_config()
-        layout.addRow("Broadcast порт (0-авто):", self.bport)
-        layout.addRow("Чат порт (0-авто):", self.cport)
-        layout.addRow("Файловый порт (0-авто):", self.fport)
-        layout.addRow("Макс. размер файла (МБ):", self.max_mb)
-        layout.addRow("Хранить историю (дней):", self.history_days)
-        layout.addRow("Путь к ключу шифрования:", self.key_path)
-        layout.addRow("Heartbeat интервал (сек):", self.heartbeat_int)
-        layout.addRow("Heartbeat таймаут (сек):", self.heartbeat_timeout)
-        layout.addRow("Папка загрузок:", self.download_path)
-        layout.addRow("", browse_btn)
-        layout.addRow("Секретный ключ (общий):", self.shared_secret)
+        self.nickname_edit = QLineEdit()
+        layout.addRow("Имя:", self.nickname_edit)
+
+        self.auto_reconnect_check = QCheckBox("Автоматическое переподключение")
+        self.auto_reconnect_check.setChecked(config.get('auto_reconnect', True))
+        layout.addRow(self.auto_reconnect_check)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Тёмная", "Светлая"])
+        current_theme = config.get('theme', 'dark')
+        self.theme_combo.setCurrentIndex(0 if current_theme == 'dark' else 1)
+        layout.addRow("Тема:", self.theme_combo)
+
+        self.font_size_combo = QComboBox()
+        self.font_size_combo.addItems(["Маленький", "Средний", "Большой"])
+        current_font = config.get('font_size', 'medium')
+        idx = 1 if current_font == 'medium' else (2 if current_font == 'large' else 0)
+        self.font_size_combo.setCurrentIndex(idx)
+        layout.addRow("Размер шрифта:", self.font_size_combo)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
         self.setLayout(layout)
 
-    def load_config(self) -> None:
-        self.bport.setValue(config.get('broadcast_port',0))
-        self.cport.setValue(config.get('chat_port',0))
-        self.fport.setValue(config.get('file_port',0))
-        self.max_mb.setValue(config.get('max_file_mb',500))
-        self.history_days.setValue(config.get('history_days',90))
-        self.key_path.setText(config.get('encryption_key_path',''))
-        self.heartbeat_int.setValue(config.get('heartbeat_interval', HEARTBEAT_INTERVAL))
-        self.heartbeat_timeout.setValue(config.get('heartbeat_timeout', HEARTBEAT_TIMEOUT))
-        self.download_path.setText(config.get('download_path', DEFAULT_DOWNLOADS_DIR))
-        self.shared_secret.setText('')
-
-    def browse_download_path(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку для загрузок", self.download_path.text())
-        if folder:
-            self.download_path.setText(folder)
-
     def save_and_accept(self) -> None:
-        config['broadcast_port'] = self.bport.value()
-        config['chat_port'] = self.cport.value()
-        config['file_port'] = self.fport.value()
-        config['max_file_mb'] = self.max_mb.value()
-        config['history_days'] = self.history_days.value()
-        config['encryption_key_path'] = self.key_path.text()
-        config['heartbeat_interval'] = self.heartbeat_int.value()
-        config['heartbeat_timeout'] = self.heartbeat_timeout.value()
-        config['download_path'] = self.download_path.text()
-        pwd = self.shared_secret.text()
-        if pwd:
-            config['shared_secret_hash'] = hashlib.sha256(pwd.encode()).hexdigest()
-        else:
-            config['shared_secret_hash'] = ''
+        config['auto_reconnect'] = self.auto_reconnect_check.isChecked()
+        config['theme'] = 'dark' if self.theme_combo.currentIndex() == 0 else 'light'
+        idx = self.font_size_combo.currentIndex()
+        config['font_size'] = 'small' if idx == 0 else ('large' if idx == 2 else 'medium')
         save_config(config)
-        if not os.path.exists(config['download_path']):
-            os.makedirs(config['download_path'], exist_ok=True)
         self.accept()
 
 class MainWindow(QMainWindow):
@@ -1232,6 +1212,10 @@ class MainWindow(QMainWindow):
         self.current_peer: Optional[str] = None
         self.unread_counts: Dict[str, int] = defaultdict(int)
         self.history_offset: Dict[str, Optional[int]] = {}
+        self.transfer_progress: Dict[str, str] = {}
+
+        auto_reconnect = config.get('auto_reconnect', True)
+        discovery_on = config.get('discovery_on', True)
 
         stored_hash = config.get('shared_secret_hash', '')
         room_hash = ''
@@ -1246,7 +1230,8 @@ class MainWindow(QMainWindow):
             room_hash = stored_hash
 
         try:
-            self.net = NetworkCore(db, nickname, broad_port, chat_port, file_port, room_hash)
+            self.net = NetworkCore(db, nickname, broad_port, chat_port, file_port, room_hash,
+                                   auto_reconnect, discovery_on)
         except Exception as e:
             QMessageBox.critical(self, "Критическая ошибка", f"Не удалось запустить сеть:\n{e}")
             sys.exit(1)
@@ -1257,8 +1242,10 @@ class MainWindow(QMainWindow):
         self.net.network_error.connect(self.show_error)
         self.net.file_transfer_failed.connect(self.on_file_transfer_failed)
         self.net.file_transfer_succeeded.connect(self.on_file_transfer_succeeded)
+        self.net.file_progress.connect(self.on_file_progress)
         self.net.reconnect_requested.connect(self.schedule_reconnect)
 
+        self._apply_theme()
         self._setup_ui()
         self._load_contacts()
 
@@ -1284,7 +1271,29 @@ class MainWindow(QMainWindow):
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
 
+    def _apply_theme(self) -> None:
+        theme = config.get('theme', 'dark')
+        if theme == 'dark':
+            style = """
+                QMainWindow { background-color: #1e1e1e; color: #d4d4d4; }
+                QWidget { background-color: #1e1e1e; color: #d4d4d4; }
+                QListWidget { background-color: #252526; color: #cccccc; }
+                QTextEdit { background-color: #1e1e1e; color: #d4d4d4; }
+                QLineEdit { background-color: #3c3c3c; color: white; }
+            """
+        else:
+            style = """
+                QMainWindow { background-color: #ffffff; color: #000000; }
+                QWidget { background-color: #f0f0f0; color: #000000; }
+                QListWidget { background-color: #ffffff; color: #000000; }
+                QTextEdit { background-color: #ffffff; color: #000000; }
+                QLineEdit { background-color: #ffffff; color: #000000; }
+            """
+        self.setStyleSheet(style)
+
     def schedule_reconnect(self, peer_id: str) -> None:
+        if not config.get('auto_reconnect', True):
+            return
         attempts = self.net.reconnect_attempts.get(peer_id, 0)
         if attempts >= MAX_RECONNECT_ATTEMPTS:
             return
@@ -1305,38 +1314,22 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
-        # ----- ЛЕВАЯ ПАНЕЛЬ: КОНТАКТЫ -----
+        # Левая панель
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         self.contact_list = QListWidget()
         self.contact_list.setFont(QFont("Segoe UI", 10))
-        self.contact_list.setStyleSheet("""
-            QListWidget {
-                background-color: #252526;
-                color: #cccccc;
-                border: none;
-            }
-            QListWidget::item {
-                padding: 8px;
-                border-bottom: 1px solid #3e3e42;
-            }
-            QListWidget::item:selected {
-                background-color: #094771;
-                color: white;
-            }
-        """)
         self.contact_list.itemClicked.connect(self.on_contact_clicked)
         left_layout.addWidget(self.contact_list)
         splitter.addWidget(left_panel)
 
-        # ----- ПРАВАЯ ПАНЕЛЬ: ЧАТ -----
+        # Правая панель
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
         self.chat_display = ChatDisplay()
-        self.chat_display.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border: none;")
         self.chat_display.file_dropped.connect(self.on_file_dropped)
         self.chat_display.history_scroll.connect(self.load_more_history)
         self.chat_display.anchorClicked.connect(self._on_anchor_clicked)
@@ -1345,19 +1338,26 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout()
         self.message_input = QLineEdit()
         self.message_input.setPlaceholderText("Введите сообщение...")
-        self.message_input.setStyleSheet("background-color: #3c3c3c; color: white; border: none; padding: 8px;")
         self.message_input.returnPressed.connect(self.send_message)
         input_layout.addWidget(self.message_input)
 
         send_btn = QPushButton("⬆")
         send_btn.setFixedWidth(40)
-        send_btn.setStyleSheet("background-color: #007acc; color: white; border: none; font-weight: bold;")
         send_btn.clicked.connect(self.send_message)
         input_layout.addWidget(send_btn)
 
         right_layout.addLayout(input_layout)
         splitter.addWidget(right_panel)
         splitter.setSizes([200, 600])
+
+        # Применить размер шрифта
+        font_size = config.get('font_size', 'medium')
+        sizes = {'small': 8, 'medium': 10, 'large': 12}
+        size = sizes.get(font_size, 10)
+        font = QFont("Segoe UI", size)
+        self.contact_list.setFont(font)
+        self.chat_display.setFont(font)
+        self.message_input.setFont(font)
 
     def _load_contacts(self) -> None:
         contacts = self.db.get_all_contacts()
@@ -1550,51 +1550,62 @@ class MainWindow(QMainWindow):
         if not self.current_peer:
             QMessageBox.warning(self, "Ошибка", "Сначала выберите контакт в списке.")
             return
+        self._start_file_send(file_path, is_folder)
+
+    def _start_file_send(self, file_path: str, is_folder: bool) -> None:
         if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
-            self.chat_display.append(f"<b>Вы:</b> <i>Отправка файла: {html.escape(os.path.basename(file_path))}</i>")
+            file_name = os.path.basename(file_path)
+            self.chat_display.append(f"<b>Вы:</b> <i>{html.escape(file_name)} → отправка 0%</i>")
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не удалось отправить файл</i>")
 
     def handle_incoming_file(self, sender_id: str, nick: str, file_name: str, file_size: int, request_id: str, is_folder: bool) -> None:
-        item_type = "папку" if is_folder else "файл"
-        reply = QMessageBox.question(
-            self,
-            "Входящий файл",
-            f"{html.escape(nick)} хочет передать {item_type}:\n{html.escape(file_name)} ({file_size} байт)\n\nПринять?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            accept_msg = json.dumps({'type': 'file_accept', 'request_id': request_id})
-            with self.net.state_lock:
-                sock = self.net.connections.get(sender_id)
-            if sock:
-                try:
-                    self.net._send_frame(sock, accept_msg)
-                except Exception:
-                    logger.exception("Error sending file accept")
+        # Автоматическое принятие файлов (без диалога)
+        accept_msg = json.dumps({'type': 'file_accept', 'request_id': request_id})
+        with self.net.state_lock:
+            sock = self.net.connections.get(sender_id)
+        if sock:
+            try:
+                self.net._send_frame(sock, accept_msg)
+            except Exception:
+                logger.exception("Error sending file accept")
+        # Показать начало приёма
+        if self.current_peer == sender_id:
+            self.chat_display.append(f"<i style='color:gray'>{html.escape(nick)}: получение {html.escape(file_name)} 0%</i>")
+
+    def on_file_progress(self, file_name: str, received: int, total: int) -> None:
+        percent = int(received / total * 100) if total else 0
+        # Обновляем последнее сообщение о прогрессе в чате
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
+        last_line = cursor.selectedText()
+        if 'отправка' in last_line or 'получение' in last_line:
+            cursor.removeSelectedText()
+            new_text = last_line.split('%')[0].rsplit(' ', 1)[0] + f" {percent}%</i>"
+            self.chat_display.append(new_text)
         else:
-            reject_msg = json.dumps({'type': 'file_reject', 'request_id': request_id})
-            with self.net.state_lock:
-                sock = self.net.connections.get(sender_id)
-            if sock:
-                try:
-                    self.net._send_frame(sock, reject_msg)
-                except Exception:
-                    logger.exception("Error sending file reject")
+            self.chat_display.append(f"<i style='color:gray'>Прогресс: {html.escape(file_name)} {percent}%</i>")
 
     def on_file_transfer_failed(self, peer_id: str, error_msg: str) -> None:
         if self.current_peer == peer_id:
-            self.chat_display.append(f"<i style='color:red'>❌ {html.escape(error_msg)}</i>")
-        else:
-            QMessageBox.warning(self, "Ошибка передачи файла", html.escape(error_msg))
+            self.chat_display.append(f"<i style='color:red'>❌ Передача не удалась: {html.escape(error_msg)}</i>")
 
     def on_file_transfer_succeeded(self, peer_id: str, file_name: str) -> None:
         if self.current_peer == peer_id:
-            self.chat_display.append(f"<i style='color:green'>✔ Файл {html.escape(file_name)} отправлен</i>")
+            self.chat_display.append(f"<i style='color:green'>✔ {html.escape(file_name)} отправлен</i>")
 
     def open_settings(self) -> None:
         dlg = SettingsDialog(self)
-        dlg.exec_()
+        if dlg.exec_() == QDialog.Accepted:
+            self._apply_theme()
+            font_size = config.get('font_size', 'medium')
+            sizes = {'small': 8, 'medium': 10, 'large': 12}
+            size = sizes.get(font_size, 10)
+            font = QFont("Segoe UI", size)
+            self.contact_list.setFont(font)
+            self.chat_display.setFont(font)
+            self.message_input.setFont(font)
 
     def show_error(self, msg: str) -> None:
         QMessageBox.critical(self, "Ошибка", msg)
@@ -1660,4 +1671,4 @@ if __name__ == "__main__":
         sys.exit(app.exec_())
     except Exception as e:
         QMessageBox.critical(None, "Ошибка запуска", str(e))
-```
+// конец третьей части
