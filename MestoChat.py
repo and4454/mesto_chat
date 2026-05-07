@@ -24,13 +24,21 @@ MAX_PREAMBLE_SIZE = 128
 MAX_HEADER_SIZE = 512
 HEARTBEAT_INTERVAL = 3
 HEARTBEAT_TIMEOUT = 9
-PEER_TIMEOUT = 20  # секунд без HELLO для офлайн-статуса
+PEER_TIMEOUT = 20
 RECONNECT_BACKOFF_MAX = 30
 MAX_RECONNECT_ATTEMPTS = 5
 TRANSFER_TIMEOUT = 30
 TRANSFER_PROGRESS_TIMEOUT = 10
-MAX_HISTORY_MESSAGES = 10000  # ограничение на количество сообщений в истории
-INACTIVE_PEER_CLEANUP_SECONDS = 600  # 10 минут
+MAX_HISTORY_MESSAGES = 10000
+INACTIVE_PEER_CLEANUP_SECONDS = 600
+
+class ConnectionState:
+    NEW = "new"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    ACTIVE = "active"
+    DISCONNECTING = "disconnecting"
+    DEAD = "dead"
 
 # ====================== КОНФИГУРАЦИЯ ======================
 DATA_DIR = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), 'MestoChat')
@@ -52,6 +60,10 @@ DEFAULT_CONFIG = {
     "heartbeat_timeout": HEARTBEAT_TIMEOUT,
     "download_path": DEFAULT_DOWNLOADS_DIR,
     "shared_secret_hash": "",
+    "auto_reconnect": True,
+    "discovery_on": True,
+    "theme": "dark",
+    "font_size": "medium"
 }
 
 def load_config() -> dict:
@@ -203,7 +215,6 @@ class ChatDatabase:
         self._retry_execute(_do)
 
     def _cleanup_old_messages(self) -> None:
-        # Ограничение по времени и количеству
         days = config.get('history_days', 90)
         if days > 0:
             cutoff = time.time() - days * 86400
@@ -213,7 +224,7 @@ class ChatDatabase:
                     cur.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
                     self.conn.commit()
             self._retry_execute(_do)
-        # Ограничение на число сообщений
+
         def _trim() -> None:
             with self._lock:
                 cur = self.conn.cursor()
@@ -226,7 +237,6 @@ class ChatDatabase:
         self._retry_execute(_trim)
 
     def _cleanup_temp_files(self) -> None:
-        """Удаляет устаревшие временные архивы."""
         temp_dir = tempfile.gettempdir()
         try:
             for fname in os.listdir(temp_dir):
@@ -240,10 +250,145 @@ class ChatDatabase:
         except Exception:
             logger.exception("Temp file cleanup error")
 
-    # (дальнейшие методы ChatDatabase без изменений: get_nickname, set_nickname...
-    # они полностью идентичны предыдущей версии и здесь опущены для краткости)
-    pass
-    
+    def get_nickname(self) -> Optional[str]:
+        return self._retry_execute(lambda: self._get_nickname_impl())
+
+    def _get_nickname_impl(self) -> Optional[str]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key='nickname'")
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def set_nickname(self, nick: str) -> None:
+        self._retry_execute(lambda: self._set_nickname_impl(nick))
+
+    def _set_nickname_impl(self, nick: str) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('nickname', ?)", (nick,))
+            self.conn.commit()
+
+    def add_contact(self, machine_id: str, nickname: str) -> None:
+        self._retry_execute(lambda: self._add_contact_impl(machine_id, nickname))
+
+    def _add_contact_impl(self, machine_id: str, nickname: str) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO contacts (machine_id, nickname, last_seen) VALUES (?, ?, ?)",
+                (machine_id, nickname, time.time())
+            )
+            self.conn.commit()
+
+    def get_all_contacts(self) -> List[Tuple[str, str]]:
+        return self._retry_execute(lambda: self._get_all_contacts_impl()) or []
+
+    def _get_all_contacts_impl(self) -> List[Tuple[str, str]]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT machine_id, nickname FROM contacts ORDER BY last_seen DESC")
+            return cur.fetchall()
+
+    def save_message(self, sender_id: str, sender_name: str, receiver_id: str,
+                     message: str, file_name: str = None, file_path: str = None,
+                     is_folder: int = 0, pending: int = 0) -> None:
+        self._retry_execute(lambda: self._save_message_impl(
+            sender_id, sender_name, receiver_id, message, file_name, file_path, is_folder, pending))
+
+    def _save_message_impl(self, sender_id: str, sender_name: str, receiver_id: str,
+                           message: str, file_name: str, file_path: str,
+                           is_folder: int, pending: int) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO messages (sender_id, sender_name, receiver_id, message, file_name, file_path, is_folder, timestamp, pending) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (sender_id, sender_name, receiver_id, message, file_name, file_path, is_folder, time.time(), pending)
+            )
+            self.conn.commit()
+
+    def get_chat_history(self, partner_id: str, limit: int = 50, before_id: int = None) -> List[Tuple]:
+        return self._retry_execute(lambda: self._get_chat_history_impl(partner_id, limit, before_id)) or []
+
+    def _get_chat_history_impl(self, partner_id: str, limit: int, before_id: int) -> List[Tuple]:
+        with self._lock:
+            cur = self.conn.cursor()
+            if before_id:
+                cur.execute(
+                    "SELECT id, sender_id, sender_name, message, file_name, file_path, is_folder, timestamp FROM messages WHERE ((sender_id=? AND receiver_id=?) OR (sender_id=? AND receiver_id=?)) AND id < ? ORDER BY timestamp DESC LIMIT ?",
+                    (MY_MACHINE_ID, partner_id, partner_id, MY_MACHINE_ID, before_id, limit)
+                )
+            else:
+                cur.execute(
+                    "SELECT id, sender_id, sender_name, message, file_name, file_path, is_folder, timestamp FROM messages WHERE (sender_id=? AND receiver_id=?) OR (sender_id=? AND receiver_id=?) ORDER BY timestamp DESC LIMIT ?",
+                    (MY_MACHINE_ID, partner_id, partner_id, MY_MACHINE_ID, limit)
+                )
+            rows = cur.fetchall()
+            rows.reverse()
+            return rows
+
+    def search_messages(self, query: str) -> List[Tuple[str, str, float]]:
+        return self._retry_execute(lambda: self._search_messages_impl(query)) or []
+
+    def _search_messages_impl(self, query: str) -> List[Tuple[str, str, float]]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT sender_name, message, timestamp FROM messages WHERE message LIKE ? ORDER BY timestamp DESC LIMIT 50",
+                (f"%{query}%",)
+            )
+            return cur.fetchall()
+
+    def increment_unread(self, machine_id: str) -> None:
+        self._retry_execute(lambda: self._increment_unread_impl(machine_id))
+
+    def _increment_unread_impl(self, machine_id: str) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO unread (machine_id, count) VALUES (?, 1) ON CONFLICT(machine_id) DO UPDATE SET count = count + 1",
+                (machine_id,)
+            )
+            self.conn.commit()
+
+    def clear_unread(self, machine_id: str) -> None:
+        self._retry_execute(lambda: self._clear_unread_impl(machine_id))
+
+    def _clear_unread_impl(self, machine_id: str) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("DELETE FROM unread WHERE machine_id=?", (machine_id,))
+            self.conn.commit()
+
+    def get_all_unread(self) -> Dict[str, int]:
+        return self._retry_execute(lambda: self._get_all_unread_impl()) or {}
+
+    def _get_all_unread_impl(self) -> Dict[str, int]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT machine_id, count FROM unread")
+            return dict(cur.fetchall())
+
+    def get_pending_messages(self, receiver_id: str) -> List[Tuple[int, str, str, str, int]]:
+        return self._retry_execute(lambda: self._get_pending_messages_impl(receiver_id)) or []
+
+    def _get_pending_messages_impl(self, receiver_id: str) -> List[Tuple[int, str, str, str, int]]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT id, message, file_name, file_path, is_folder FROM messages WHERE sender_id=? AND receiver_id=? AND pending=1 ORDER BY timestamp",
+                (MY_MACHINE_ID, receiver_id)
+            )
+            return cur.fetchall()
+
+    def mark_sent(self, msg_id: int) -> None:
+        self._retry_execute(lambda: self._mark_sent_impl(msg_id))
+
+    def _mark_sent_impl(self, msg_id: int) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE messages SET pending=0 WHERE id=?", (msg_id,))
+            self.conn.commit()
 
 # ====================== СЕТЕВОЙ ДВИЖОК ======================
 executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="Mesto")
@@ -292,6 +437,7 @@ class NetworkCore(QObject):
         self.last_pong: Dict[str, float] = {}
         self.reconnect_attempts: Dict[str, int] = defaultdict(int)
         self.reconnecting: Dict[str, bool] = defaultdict(lambda: False)
+        self.connection_states: Dict[str, str] = defaultdict(lambda: ConnectionState.NEW)
         self.threads: List[threading.Thread] = []
 
         try:
@@ -340,31 +486,26 @@ class NetworkCore(QObject):
         logger.info("Shutting down network core")
         self.running = False
 
-        # 1. Остановка всех сокетов для разблокировки потоков
         safe_close_socket(self.udp_sock)
         safe_close_socket(self.chat_server_sock)
         safe_close_socket(self.file_server_sock)
 
-        # 2. Безопасное извлечение и закрытие всех peer-соединений
         with self.state_lock:
             conns = list(self.connections.values())
             self.connections.clear()
         for sock in conns:
             safe_close_socket(sock)
 
-        # 3. Ожидание потоков с таймаутом
         for t in self.threads:
             if t.is_alive():
                 t.join(timeout=2)
             if t.is_alive():
                 logger.warning(f"Thread {t.name} did not terminate")
 
-        # 4. Очистка старых пиров, которые давно не проявляли активность
         self._cleanup_inactive_peers()
         logger.info("Shutdown complete")
 
     def _cleanup_inactive_peers(self) -> None:
-        """Удаление пиров, неактивных более INACTIVE_PEER_CLEANUP_SECONDS."""
         now = time.time()
         with self.state_lock:
             inactive = [pid for pid, (_, _, last, _, _) in self.peers.items()
@@ -372,8 +513,9 @@ class NetworkCore(QObject):
             for pid in inactive:
                 del self.peers[pid]
                 self.last_pong.pop(pid, None)
+                self.connection_states.pop(pid, None)
 
-    # ===== UDP DISCOVERY =====
+    # ----- UDP DISCOVERY -----
     def _send_hello(self) -> None:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -442,9 +584,11 @@ class NetworkCore(QObject):
                     logger.warning(f"IP change for {peer_id} ({peer_nick}): {old_ips} -> {new_ips}")
             self.peers[peer_id] = (peer_ips, peer_nick, time.time(), peer_chat_port, peer_file_port)
             self.last_pong[peer_id] = time.time()
+            if self.connection_states[peer_id] == ConnectionState.DEAD:
+                self.connection_states[peer_id] = ConnectionState.NEW
         self.db.add_contact(peer_id, peer_nick)
         self._merge_contacts()
-        if peer_id not in self.connections:
+        if peer_id not in self.connections and self.connection_states[peer_id] != ConnectionState.CONNECTING:
             self._try_connect_to_peer(peer_id, peer_ips, peer_chat_port)
 
     def _handle_ping_packet(self, addr: Tuple[str, int]) -> None:
@@ -460,7 +604,7 @@ class NetworkCore(QObject):
             with self.state_lock:
                 self.last_pong[peer_id] = time.time()
 
-    # ===== HEARTBEAT =====
+    # ----- HEARTBEAT -----
     def _heartbeat_loop(self) -> None:
         while self.running:
             time.sleep(config.get('heartbeat_interval', HEARTBEAT_INTERVAL))
@@ -484,13 +628,13 @@ class NetworkCore(QObject):
                     logger.info(f"Heartbeat timeout for {pid}, closing")
                     safe_close_socket(self.connections[pid])
                     del self.connections[pid]
+                    self.connection_states[pid] = ConnectionState.DEAD
                     self.connection_state_changed.emit(pid, False)
                     self.reconnect_requested.emit(pid)
             self._merge_contacts()
 
-    # ===== CONNECTION MANAGEMENT =====
+    # ----- CONNECTION MANAGEMENT -----
     def _merge_contacts(self) -> None:
-        """Создаёт снимок и объединяет сетевые данные с БД."""
         db_contacts = {mid: nick for mid, nick in self.db.get_all_contacts() if mid != MY_MACHINE_ID}
         combined = {}
         with self.state_lock:
@@ -506,6 +650,10 @@ class NetworkCore(QObject):
         self.contact_update.emit(combined)
 
     def _try_connect_to_peer(self, peer_id: str, ips: List[str], chat_port: int) -> None:
+        with self.state_lock:
+            if self.connection_states[peer_id] in (ConnectionState.CONNECTING, ConnectionState.ACTIVE):
+                return
+            self.connection_states[peer_id] = ConnectionState.CONNECTING
         for ip in ips:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2.0)
@@ -518,14 +666,18 @@ class NetworkCore(QObject):
             with self.state_lock:
                 if peer_id in self.connections:
                     safe_close_socket(sock)
+                    self.connection_states[peer_id] = ConnectionState.CONNECTED
                     return
                 self.connections[peer_id] = sock
                 self.last_pong[peer_id] = time.time()
+                self.connection_states[peer_id] = ConnectionState.CONNECTED
             sock.settimeout(30)
             executor.submit(self._chat_receiver, sock, peer_id)
             self._send_identity(sock)
             self._send_pending_messages(peer_id)
             return
+        with self.state_lock:
+            self.connection_states[peer_id] = ConnectionState.NEW
 
     def _send_identity(self, sock: socket.socket) -> None:
         identity = json.dumps({
@@ -540,9 +692,11 @@ class NetworkCore(QObject):
         if not self.auto_reconnect:
             return
         with self.state_lock:
+            if self.reconnecting.get(peer_id, False):
+                return
             if peer_id in self.connections or not self.running:
                 return
-            if self.reconnecting.get(peer_id, False):
+            if self.connection_states[peer_id] == ConnectionState.DEAD:
                 return
             self.reconnecting[peer_id] = True
             if peer_id not in self.peers:
@@ -553,13 +707,16 @@ class NetworkCore(QObject):
         with self.state_lock:
             if peer_id in self.connections:
                 self.reconnect_attempts[peer_id] = 0
+                self.connection_states[peer_id] = ConnectionState.CONNECTED
             else:
                 self.reconnect_attempts[peer_id] += 1
                 if self.reconnect_attempts[peer_id] < MAX_RECONNECT_ATTEMPTS:
                     self.reconnect_requested.emit(peer_id)
+                else:
+                    self.connection_states[peer_id] = ConnectionState.DEAD
             self.reconnecting[peer_id] = False
 
-    # ===== CHAT SERVER =====
+    # ----- CHAT SERVER -----
     def _chat_server_loop(self) -> None:
         while self.running:
             try:
@@ -617,6 +774,7 @@ class NetworkCore(QObject):
                 ips, _, _, _, _ = self.peers[peer_id]
                 self.peers[peer_id] = (ips, peer_nick, time.time(), self.chat_port, self.file_port)
             self.last_pong[peer_id] = time.time()
+            self.connection_states[peer_id] = ConnectionState.ACTIVE
         self._merge_contacts()
         executor.submit(self._chat_receiver, client_sock, peer_id)
         self._send_pending_messages(peer_id)
@@ -648,6 +806,7 @@ class NetworkCore(QObject):
         with self.state_lock:
             if peer_id in self.connections and self.connections[peer_id] == sock:
                 del self.connections[peer_id]
+                self.connection_states[peer_id] = ConnectionState.DEAD
         safe_close_socket(sock)
         self._merge_contacts()
         if self.running:
@@ -687,7 +846,7 @@ class NetworkCore(QObject):
         self.db.add_contact(peer_id, new_nick)
         self._merge_contacts()
 
-    # ===== MESSAGING =====
+    # ----- MESSAGING -----
     def send_message(self, peer_id: str, text: str) -> bool:
         with self.state_lock:
             sock = self.connections.get(peer_id)
@@ -750,7 +909,7 @@ class NetworkCore(QObject):
         with self.state_lock:
             self.offered_files.pop(request_id, None)
 
-    # ===== FILE TRANSFER =====
+    # ----- FILE TRANSFER -----
     def _send_file_to(self, receiver_id: str, request_id: str) -> None:
         with self.state_lock:
             info = self.offered_files.pop(request_id, None)
@@ -914,14 +1073,13 @@ class NetworkCore(QObject):
             logger.exception("File receive error")
         finally:
             safe_close_socket(sock)
-            # Если остался временный файл – удалить
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except Exception:
                     logger.exception("Failed to remove temp file")
 
-    # ===== PROTOCOL HELPERS =====
+    # ----- PROTOCOL HELPERS -----
     def _send_frame(self, sock: socket.socket, plain: str) -> None:
         data = plain.encode()
         length = len(data)
@@ -1000,7 +1158,6 @@ class NetworkCore(QObject):
             else:
                 if self._send_message_raw(peer_id, text):
                     self.db.mark_sent(msg_id)
-
 
 # ====================== GUI ======================
 class ChatDisplay(QTextEdit):
@@ -1212,7 +1369,6 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
-        # Левая панель
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -1222,7 +1378,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.contact_list)
         splitter.addWidget(left_panel)
 
-        # Правая панель
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -1248,7 +1403,6 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_panel)
         splitter.setSizes([200, 600])
 
-        # Применить размер шрифта
         font_size = config.get('font_size', 'medium')
         sizes = {'small': 8, 'medium': 10, 'large': 12}
         size = sizes.get(font_size, 10)
@@ -1455,7 +1609,6 @@ class MainWindow(QMainWindow):
             self.chat_display.append("<i style='color:red'>⚠ Не удалось отправить файл</i>")
 
     def handle_incoming_file(self, sender_id: str, nick: str, file_name: str, file_size: int, request_id: str, is_folder: bool) -> None:
-        # Автоматическое принятие файлов (без диалога)
         accept_msg = json.dumps({'type': 'file_accept', 'request_id': request_id})
         with self.net.state_lock:
             sock = self.net.connections.get(sender_id)
@@ -1464,13 +1617,11 @@ class MainWindow(QMainWindow):
                 self.net._send_frame(sock, accept_msg)
             except Exception:
                 logger.exception("Error sending file accept")
-        # Показать начало приёма
         if self.current_peer == sender_id:
             self.chat_display.append(f"<i style='color:gray'>{html.escape(nick)}: получение {html.escape(file_name)} 0%</i>")
 
     def on_file_progress(self, file_name: str, received: int, total: int) -> None:
         percent = int(received / total * 100) if total else 0
-        # Обновляем последнее сообщение о прогрессе в чате
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.End)
         cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
