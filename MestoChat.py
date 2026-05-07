@@ -1,4 +1,3 @@
-```python
 import sys, os, socket, threading, json, time, struct, uuid, random, logging, zipfile, tempfile, shutil, sqlite3, hashlib, html
 from datetime import datetime
 from collections import defaultdict
