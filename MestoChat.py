@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
     "heartbeat_interval": 3,
     "heartbeat_timeout": 9,
     "download_path": DEFAULT_DOWNLOADS_DIR,
-    "shared_secret": ""
+    "shared_secret_hash": ""
 }
 
 def load_config():
@@ -358,7 +358,7 @@ class NetworkCore(QObject):
     connection_state_changed = pyqtSignal(str, bool)
     reconnect_requested = pyqtSignal(str)
 
-    def __init__(self, db, nickname, broadcast_port, chat_port, file_port):
+    def __init__(self, db, nickname, broadcast_port, chat_port, file_port, room_hash=''):
         super().__init__()
         self.db = db
         self.nickname = nickname
@@ -368,8 +368,7 @@ class NetworkCore(QObject):
         self.running = True
         self.local_ips = get_all_local_ips()
         self.lock = threading.RLock()
-        self.shared_secret = config.get('shared_secret', '')
-        self.room_hash = hashlib.sha256(self.shared_secret.encode()).hexdigest() if self.shared_secret else ''
+        self.room_hash = room_hash
         self.peer_ips_history = defaultdict(set)
         self.peers = {}            # machine_id: (ips, nickname, last_hello, chat_port, file_port)
         self.connections = {}
@@ -442,19 +441,22 @@ class NetworkCore(QObject):
             self.connections.clear()
 
     def _send_hello(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = json.dumps({
-            'type': 'HELLO',
-            'machine_id': MY_MACHINE_ID,
-            'nickname': self.nickname,
-            'chat_port': self.chat_port,
-            'file_port': self.file_port,
-            'ips': self.local_ips,
-            'room_hash': self.room_hash
-        })
-        sock.sendto(msg.encode(), ('255.255.255.255', self.broadcast_port))
-        sock.close()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            msg = json.dumps({
+                'type': 'HELLO',
+                'machine_id': MY_MACHINE_ID,
+                'nickname': self.nickname,
+                'chat_port': self.chat_port,
+                'file_port': self.file_port,
+                'ips': self.local_ips,
+                'room_hash': self.room_hash
+            })
+            sock.sendto(msg.encode(), ('255.255.255.255', self.broadcast_port))
+            sock.close()
+        except Exception as e:
+            logger.error(f"send_hello error: {e}")
 
     def _validate_message(self, data, required_type=None):
         if 'type' not in data:
@@ -470,7 +472,7 @@ class NetworkCore(QObject):
         return True
 
     def _validate_hello(self, msg):
-        if not self.shared_secret:
+        if not self.room_hash:
             return True
         return msg.get('room_hash') == self.room_hash
 
@@ -563,18 +565,28 @@ class NetworkCore(QObject):
             sock.settimeout(2.0)
             try:
                 sock.connect((ip, chat_port))
-                with self.lock:
-                    self.connections[peer_id] = sock
-                executor.submit(self._chat_receiver, sock, peer_id)
-                self._send_identity(sock)
-                self._send_pending_messages(peer_id)
-                return
             except Exception as e:
                 logger.warning(f"Connect to {ip}:{chat_port} failed: {e}")
                 safe_close(sock)
+                continue
+            with self.lock:
+                if peer_id in self.connections:
+                    safe_close(sock)
+                    return
+                self.connections[peer_id] = sock
+            sock.settimeout(30)
+            executor.submit(self._chat_receiver, sock, peer_id)
+            self._send_identity(sock)
+            self._send_pending_messages(peer_id)
+            return
 
     def _send_identity(self, sock):
-        identity = json.dumps({'type': 'identity', 'machine_id': MY_MACHINE_ID, 'nickname': self.nickname})
+        identity = json.dumps({
+            'type': 'identity',
+            'machine_id': MY_MACHINE_ID,
+            'nickname': self.nickname,
+            'room_hash': self.room_hash
+        })
         self._send_frame(sock, identity)
 
     def _chat_server_loop(self):
@@ -585,6 +597,7 @@ class NetworkCore(QObject):
                     if len(self.connections) >= MAX_CONNECTIONS:
                         safe_close(client_sock)
                         continue
+                client_sock.settimeout(30)
                 identity = self._recv_frame(client_sock)
                 if not identity:
                     safe_close(client_sock)
@@ -594,18 +607,23 @@ class NetworkCore(QObject):
                 except:
                     safe_close(client_sock)
                     continue
-                # identity не валидируется так же строго, как обычные сообщения
                 if data.get('type') == 'identity':
+                    if self.room_hash and data.get('room_hash') != self.room_hash:
+                        logger.warning("Connection rejected: room_hash mismatch")
+                        safe_close(client_sock)
+                        continue
                     peer_id = data['machine_id']
                     peer_nick = data['nickname']
                 else:
-                    # на случай если это не identity, пробуем обычную валидацию
                     if not self._validate_message(data):
                         safe_close(client_sock)
                         continue
                     peer_id = data['machine_id']
                     peer_nick = data.get('nickname', 'Unknown')
                 with self.lock:
+                    if peer_id in self.connections:
+                        safe_close(client_sock)
+                        continue
                     self.connections[peer_id] = client_sock
                     if peer_id not in self.peers:
                         self.peers[peer_id] = ([addr[0]], peer_nick, time.time(), self.chat_port, self.file_port)
@@ -635,6 +653,8 @@ class NetworkCore(QObject):
                 if not self._validate_message(data):
                     continue
                 self._process_message(peer_id, data)
+            except socket.timeout:
+                continue
             except Exception as e:
                 logger.warning(f"Chat receiver error for {peer_id}: {e}")
                 break
@@ -937,7 +957,7 @@ class NetworkCore(QObject):
 # GUI
 # ----------------------------------------------------------------------
 class ChatDisplay(QTextEdit):
-    file_dropped = pyqtSignal(str)
+    file_dropped = pyqtSignal(str, bool)  # file_path, is_folder
     history_scroll = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -947,7 +967,7 @@ class ChatDisplay(QTextEdit):
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
     def _on_scroll(self, value):
-        if value == self.verticalScrollBar().minimum():
+        if value <= self.verticalScrollBar().minimum() + 10:
             self.history_scroll.emit()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -963,11 +983,13 @@ class ChatDisplay(QTextEdit):
             for url in event.mimeData().urls():
                 path = url.toLocalFile()
                 if os.path.isdir(path):
-                    tmp = os.path.join(tempfile.gettempdir(), f"folder_{uuid.uuid4()}.zip")
-                    shutil.make_archive(tmp.replace('.zip', ''), 'zip', path)
-                    path = tmp + '.zip'
-                if os.path.isfile(path):
-                    self.file_dropped.emit(path)
+                    base = os.path.join(tempfile.gettempdir(), f"folder_{uuid.uuid4()}")
+                    archive_path = shutil.make_archive(base, 'zip', path)
+                    self.file_dropped.emit(archive_path, True)
+                    event.acceptProposedAction()
+                    return
+                elif os.path.isfile(path):
+                    self.file_dropped.emit(path, False)
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -1039,7 +1061,7 @@ class SettingsDialog(QDialog):
         self.heartbeat_int.setValue(config.get('heartbeat_interval',3))
         self.heartbeat_timeout.setValue(config.get('heartbeat_timeout',9))
         self.download_path.setText(config.get('download_path', DEFAULT_DOWNLOADS_DIR))
-        self.shared_secret.setText(config.get('shared_secret', ''))
+        self.shared_secret.setText('')
 
     def browse_download_path(self):
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку для загрузок", self.download_path.text())
@@ -1056,7 +1078,11 @@ class SettingsDialog(QDialog):
         config['heartbeat_interval'] = self.heartbeat_int.value()
         config['heartbeat_timeout'] = self.heartbeat_timeout.value()
         config['download_path'] = self.download_path.text()
-        config['shared_secret'] = self.shared_secret.text()
+        pwd = self.shared_secret.text()
+        if pwd:
+            config['shared_secret_hash'] = hashlib.sha256(pwd.encode()).hexdigest()
+        else:
+            config['shared_secret_hash'] = ''
         save_config(config)
         if not os.path.exists(config['download_path']):
             os.makedirs(config['download_path'], exist_ok=True)
@@ -1103,14 +1129,26 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.db = db
         self.nickname = nickname
-        self.setWindowTitle(f"MestoChat — {nickname}")
+        self.setWindowTitle(f"MestoChat — {html.escape(nickname)}")
         self.setMinimumSize(900, 600)
         self.current_peer = None
         self.unread_counts = defaultdict(int)
         self.history_offset = {}
 
+        stored_hash = config.get('shared_secret_hash', '')
+        room_hash = ''
+        if stored_hash:
+            password, ok = QInputDialog.getText(self, "Пароль комнаты", "Введите секретный ключ:", QLineEdit.Password)
+            if not ok or not password:
+                QMessageBox.critical(self, "Ошибка", "Для входа в комнату требуется пароль.")
+                sys.exit(1)
+            if hashlib.sha256(password.encode()).hexdigest() != stored_hash:
+                QMessageBox.critical(self, "Ошибка", "Неверный пароль комнаты.")
+                sys.exit(1)
+            room_hash = stored_hash
+
         try:
-            self.net = NetworkCore(db, nickname, broad_port, chat_port, file_port)
+            self.net = NetworkCore(db, nickname, broad_port, chat_port, file_port, room_hash)
         except Exception as e:
             QMessageBox.critical(self, "Критическая ошибка", f"Не удалось запустить сеть:\n{e}")
             sys.exit(1)
@@ -1419,20 +1457,18 @@ class MainWindow(QMainWindow):
             return
         files, _ = QFileDialog.getOpenFileNames(self, "Выберите файлы", "", "Все файлы (*.*)")
         for f in files:
-            self.offer_file(f)
+            self.offer_file(f, is_folder=False)
 
-    def on_file_dropped(self, file_path):
+    def on_file_dropped(self, file_path, is_folder):
         if not self.current_peer:
             QMessageBox.warning(self, "Ошибка", "Сначала выберите контакт в списке.")
             return
-        is_folder = file_path.lower().endswith('.zip') and file_path.startswith(tempfile.gettempdir())
         if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
             self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {html.escape(os.path.basename(file_path))}</i>")
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не удалось предложить файл (контакт офлайн?)</i>")
 
-    def offer_file(self, file_path):
-        is_folder = file_path.lower().endswith('.zip') and file_path.startswith(tempfile.gettempdir())
+    def offer_file(self, file_path, is_folder=False):
         if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
             self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {html.escape(os.path.basename(file_path))}</i>")
         else:
