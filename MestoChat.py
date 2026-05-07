@@ -4,6 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
+from typing import Optional, Dict, List, Tuple, Any
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -15,9 +16,27 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QUrl
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QTextCursor, QDesktopServices, QPixmap, QDragMoveEvent
 
-# ----------------------------------------------------------------------
-# Конфигурация
-# ----------------------------------------------------------------------
+# ====================== CONFIG CONSTANTS ======================
+BUFFER_SIZE = 8192
+UDP_BUFFER_SIZE = 4096
+MAX_MESSAGE_SIZE = 10 * 1024 * 1024
+FILE_CHUNK_SIZE = 65536
+MAX_PREAMBLE_SIZE = 128
+MAX_HEADER_SIZE = 512
+
+HEARTBEAT_INTERVAL = 3
+HEARTBEAT_TIMEOUT = 9
+PEER_TIMEOUT = 20  # seconds without hello to consider offline
+RECONNECT_BACKOFF_MAX = 30
+MAX_RECONNECT_ATTEMPTS = 5
+
+DB_TIMEOUT = 5
+DB_RETRIES = 5
+
+TRANSFER_TIMEOUT = 30  # seconds for whole transfer
+TRANSFER_PROGRESS_TIMEOUT = 10  # seconds without progress
+
+# ====================== CONFIGURATION LOADER ======================
 DATA_DIR = os.path.join(os.getenv('APPDATA', os.path.expanduser('~')), 'MestoChat')
 os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
@@ -33,13 +52,13 @@ DEFAULT_CONFIG = {
     "max_file_mb": 500,
     "history_days": 90,
     "encryption_key_path": "",
-    "heartbeat_interval": 3,
-    "heartbeat_timeout": 9,
+    "heartbeat_interval": HEARTBEAT_INTERVAL,
+    "heartbeat_timeout": HEARTBEAT_TIMEOUT,
     "download_path": DEFAULT_DOWNLOADS_DIR,
     "shared_secret_hash": ""
 }
 
-def load_config():
+def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, 'r') as f:
             cfg = json.load(f)
@@ -50,7 +69,7 @@ def load_config():
         save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
 
-def save_config(cfg):
+def save_config(cfg: dict) -> None:
     with open(CONFIG_PATH, 'w') as f:
         json.dump(cfg, f, indent=4)
 
@@ -62,7 +81,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
-logger = logging.getLogger('MestoChat')
+logger = logging.getLogger('mestochat')
 
 if not os.path.exists(MACHINE_ID_PATH):
     machine_id = str(uuid.uuid4())
@@ -71,66 +90,68 @@ if not os.path.exists(MACHINE_ID_PATH):
 else:
     with open(MACHINE_ID_PATH, 'r') as f:
         machine_id = f.read().strip()
-MY_MACHINE_ID = machine_id
+MY_MACHINE_ID: str = machine_id
 
-# ----------------------------------------------------------------------
-# Сетевые утилиты
-# ----------------------------------------------------------------------
-def get_free_port(start=50000, end=50100):
+# ====================== NETWORK UTILS ======================
+def get_free_port(start: int = 50000, end: int = 50100) -> int:
     for port in range(start, end):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(('', port))
                 return port
-            except:
+            except OSError:
                 continue
     return random.randint(49152, 65535)
 
-def get_all_local_ips():
-    ips = set()
+def get_all_local_ips() -> List[str]:
+    ips: set = set()
     hostname = socket.gethostname()
     try:
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_DGRAM):
             ip = info[4][0]
             if not ip.startswith('127.'):
                 ips.add(ip)
-    except:
-        pass
+    except Exception:
+        logger.exception("Failed to get local IPs")
     if not ips:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(('10.254.254.254', 1))
             ips.add(s.getsockname()[0])
-        except:
-            pass
+        except Exception:
+            logger.exception("Fallback IP detection failed")
         finally:
             s.close()
     return list(ips)
 
-def safe_close(sock):
-    if sock:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except:
-            pass
-        try:
-            sock.close()
-        except:
-            pass
+def safe_close_socket(sock: Optional[socket.socket]) -> None:
+    if not sock:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    except Exception:
+        logger.exception("Error shutting down socket")
+    try:
+        sock.close()
+    except OSError:
+        pass
+    except Exception:
+        logger.exception("Error closing socket")
 
-# ----------------------------------------------------------------------
-# База данных
-# ----------------------------------------------------------------------
+# ====================== DATABASE ======================
 class ChatDatabase:
-    def __init__(self, db_path=DB_PATH):
-        self.lock = threading.RLock()
+    def __init__(self, db_path: str = DB_PATH) -> None:
+        self._lock = threading.RLock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._create_tables()
         self._cleanup_old_messages()
+        self._cleanup_temp_files()
 
-    def _retry_execute(self, func, max_retries=5):
+    def _retry_execute(self, func, max_retries: int = DB_RETRIES) -> Optional[Any]:
         for i in range(max_retries):
             try:
                 return func()
@@ -138,15 +159,16 @@ class ChatDatabase:
                 if "locked" in str(e) and i < max_retries - 1:
                     time.sleep(0.1)
                 else:
+                    logger.exception("DB operational error")
                     raise
-            except Exception as e:
-                logger.error(f"DB error: {e}")
+            except Exception:
+                logger.exception("Unexpected DB error")
                 raise
         return None
 
-    def _create_tables(self):
-        def _do():
-            with self.lock:
+    def _create_tables(self) -> None:
+        def _do() -> None:
+            with self._lock:
                 cur = self.conn.cursor()
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS messages (
@@ -184,42 +206,58 @@ class ChatDatabase:
                 self.conn.commit()
         self._retry_execute(_do)
 
-    def _cleanup_old_messages(self):
+    def _cleanup_old_messages(self) -> None:
         days = config.get('history_days', 90)
         if days <= 0:
             return
         cutoff = time.time() - days * 86400
-        def _do():
-            with self.lock:
+        def _do() -> None:
+            with self._lock:
                 cur = self.conn.cursor()
                 cur.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
                 self.conn.commit()
+                logger.info("Old messages cleaned up")
         self._retry_execute(_do)
 
-    def get_nickname(self):
+    def _cleanup_temp_files(self) -> None:
+        """Remove stale temporary archives and failed downloads."""
+        temp_dir = tempfile.gettempdir()
+        try:
+            for fname in os.listdir(temp_dir):
+                if fname.startswith('folder_') and fname.endswith('.zip'):
+                    fpath = os.path.join(temp_dir, fname)
+                    try:
+                        os.remove(fpath)
+                        logger.info(f"Removed stale temp archive {fpath}")
+                    except OSError:
+                        logger.exception(f"Could not remove {fpath}")
+        except Exception:
+            logger.exception("Temp file cleanup error")
+
+    def get_nickname(self) -> Optional[str]:
         return self._retry_execute(lambda: self._get_nickname_impl())
 
-    def _get_nickname_impl(self):
-        with self.lock:
+    def _get_nickname_impl(self) -> Optional[str]:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute("SELECT value FROM settings WHERE key='nickname'")
             row = cur.fetchone()
             return row[0] if row else None
 
-    def set_nickname(self, nick):
+    def set_nickname(self, nick: str) -> None:
         self._retry_execute(lambda: self._set_nickname_impl(nick))
 
-    def _set_nickname_impl(self, nick):
-        with self.lock:
+    def _set_nickname_impl(self, nick: str) -> None:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('nickname', ?)", (nick,))
             self.conn.commit()
 
-    def add_contact(self, machine_id, nickname):
+    def add_contact(self, machine_id: str, nickname: str) -> None:
         self._retry_execute(lambda: self._add_contact_impl(machine_id, nickname))
 
-    def _add_contact_impl(self, machine_id, nickname):
-        with self.lock:
+    def _add_contact_impl(self, machine_id: str, nickname: str) -> None:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "INSERT OR REPLACE INTO contacts (machine_id, nickname, last_seen) VALUES (?, ?, ?)",
@@ -227,20 +265,25 @@ class ChatDatabase:
             )
             self.conn.commit()
 
-    def get_all_contacts(self):
+    def get_all_contacts(self) -> List[Tuple[str, str]]:
         return self._retry_execute(lambda: self._get_all_contacts_impl()) or []
 
-    def _get_all_contacts_impl(self):
-        with self.lock:
+    def _get_all_contacts_impl(self) -> List[Tuple[str, str]]:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute("SELECT machine_id, nickname FROM contacts ORDER BY last_seen DESC")
             return cur.fetchall()
 
-    def save_message(self, sender_id, sender_name, receiver_id, message, file_name=None, file_path=None, is_folder=0, pending=0):
-        self._retry_execute(lambda: self._save_message_impl(sender_id, sender_name, receiver_id, message, file_name, file_path, is_folder, pending))
+    def save_message(self, sender_id: str, sender_name: str, receiver_id: str,
+                     message: str, file_name: str = None, file_path: str = None,
+                     is_folder: int = 0, pending: int = 0) -> None:
+        self._retry_execute(lambda: self._save_message_impl(
+            sender_id, sender_name, receiver_id, message, file_name, file_path, is_folder, pending))
 
-    def _save_message_impl(self, sender_id, sender_name, receiver_id, message, file_name, file_path, is_folder, pending):
-        with self.lock:
+    def _save_message_impl(self, sender_id: str, sender_name: str, receiver_id: str,
+                           message: str, file_name: str, file_path: str,
+                           is_folder: int, pending: int) -> None:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "INSERT INTO messages (sender_id, sender_name, receiver_id, message, file_name, file_path, is_folder, timestamp, pending) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -248,11 +291,11 @@ class ChatDatabase:
             )
             self.conn.commit()
 
-    def get_chat_history(self, partner_id, limit=50, before_id=None):
+    def get_chat_history(self, partner_id: str, limit: int = 50, before_id: int = None) -> List[Tuple]:
         return self._retry_execute(lambda: self._get_chat_history_impl(partner_id, limit, before_id)) or []
 
-    def _get_chat_history_impl(self, partner_id, limit, before_id):
-        with self.lock:
+    def _get_chat_history_impl(self, partner_id: str, limit: int, before_id: int) -> List[Tuple]:
+        with self._lock:
             cur = self.conn.cursor()
             if before_id:
                 cur.execute(
@@ -268,11 +311,11 @@ class ChatDatabase:
             rows.reverse()
             return rows
 
-    def search_messages(self, query):
+    def search_messages(self, query: str) -> List[Tuple[str, str, float]]:
         return self._retry_execute(lambda: self._search_messages_impl(query)) or []
 
-    def _search_messages_impl(self, query):
-        with self.lock:
+    def _search_messages_impl(self, query: str) -> List[Tuple[str, str, float]]:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "SELECT sender_name, message, timestamp FROM messages WHERE message LIKE ? ORDER BY timestamp DESC LIMIT 50",
@@ -280,11 +323,11 @@ class ChatDatabase:
             )
             return cur.fetchall()
 
-    def increment_unread(self, machine_id):
+    def increment_unread(self, machine_id: str) -> None:
         self._retry_execute(lambda: self._increment_unread_impl(machine_id))
 
-    def _increment_unread_impl(self, machine_id):
-        with self.lock:
+    def _increment_unread_impl(self, machine_id: str) -> None:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "INSERT INTO unread (machine_id, count) VALUES (?, 1) ON CONFLICT(machine_id) DO UPDATE SET count = count + 1",
@@ -292,29 +335,29 @@ class ChatDatabase:
             )
             self.conn.commit()
 
-    def clear_unread(self, machine_id):
+    def clear_unread(self, machine_id: str) -> None:
         self._retry_execute(lambda: self._clear_unread_impl(machine_id))
 
-    def _clear_unread_impl(self, machine_id):
-        with self.lock:
+    def _clear_unread_impl(self, machine_id: str) -> None:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute("DELETE FROM unread WHERE machine_id=?", (machine_id,))
             self.conn.commit()
 
-    def get_all_unread(self):
+    def get_all_unread(self) -> Dict[str, int]:
         return self._retry_execute(lambda: self._get_all_unread_impl()) or {}
 
-    def _get_all_unread_impl(self):
-        with self.lock:
+    def _get_all_unread_impl(self) -> Dict[str, int]:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute("SELECT machine_id, count FROM unread")
             return dict(cur.fetchall())
 
-    def get_pending_messages(self, receiver_id):
+    def get_pending_messages(self, receiver_id: str) -> List[Tuple[int, str, str, str, int]]:
         return self._retry_execute(lambda: self._get_pending_messages_impl(receiver_id)) or []
 
-    def _get_pending_messages_impl(self, receiver_id):
-        with self.lock:
+    def _get_pending_messages_impl(self, receiver_id: str) -> List[Tuple[int, str, str, str, int]]:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute(
                 "SELECT id, message, file_name, file_path, is_folder FROM messages WHERE sender_id=? AND receiver_id=? AND pending=1 ORDER BY timestamp",
@@ -322,18 +365,16 @@ class ChatDatabase:
             )
             return cur.fetchall()
 
-    def mark_sent(self, msg_id):
+    def mark_sent(self, msg_id: int) -> None:
         self._retry_execute(lambda: self._mark_sent_impl(msg_id))
 
-    def _mark_sent_impl(self, msg_id):
-        with self.lock:
+    def _mark_sent_impl(self, msg_id: int) -> None:
+        with self._lock:
             cur = self.conn.cursor()
             cur.execute("UPDATE messages SET pending=0 WHERE id=?", (msg_id,))
             self.conn.commit()
 
-# ----------------------------------------------------------------------
-# Сетевой движок
-# ----------------------------------------------------------------------
+# ====================== NETWORK CORE ======================
 executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="Mesto")
 MAX_CONNECTIONS = 20
 
@@ -358,7 +399,9 @@ class NetworkCore(QObject):
     connection_state_changed = pyqtSignal(str, bool)
     reconnect_requested = pyqtSignal(str)
 
-    def __init__(self, db, nickname, broadcast_port, chat_port, file_port, room_hash=''):
+    def __init__(self, db: ChatDatabase, nickname: str,
+                 broadcast_port: int, chat_port: int, file_port: int,
+                 room_hash: str = '') -> None:
         super().__init__()
         self.db = db
         self.nickname = nickname
@@ -367,80 +410,88 @@ class NetworkCore(QObject):
         self.file_port = file_port
         self.running = True
         self.local_ips = get_all_local_ips()
-        self.lock = threading.RLock()
+        self.state_lock = threading.RLock()
         self.room_hash = room_hash
-        self.peer_ips_history = defaultdict(set)
-        self.peers = {}            # machine_id: (ips, nickname, last_hello, chat_port, file_port)
-        self.connections = {}
-        self.offered_files = {}    # request_id: (file_path, sender_id, is_folder)
-        self.last_pong = {}
-        self.reconnect_attempts = defaultdict(int)
+        self.peers: Dict[str, Tuple[List[str], str, float, int, int]] = {}
+        self.connections: Dict[str, socket.socket] = {}
+        self.offered_files: Dict[str, Tuple[str, str, bool]] = {}
+        self.last_pong: Dict[str, float] = {}
+        self.reconnect_attempts: Dict[str, int] = defaultdict(int)
+        self.reconnecting: Dict[str, bool] = defaultdict(lambda: False)
 
-        self.udp_sock = None
-        self.chat_server_sock = None
-        self.file_server_sock = None
+        self.threads: List[threading.Thread] = []
 
         try:
-            self._start_udp_listener()
-            self._start_chat_server()
-            self._start_file_server()
-        except Exception as e:
-            logger.error(f"Failed to start network services: {e}")
-            self.network_error.emit(f"Не удалось запустить сетевые службы: {e}")
+            self._init_sockets()
+            self._send_hello()
+            self._start_threads()
+            self._merge_contacts()
+        except Exception:
+            self.network_error.emit("Не удалось запустить сетевые службы")
+            raise
 
-        self._send_hello()
-        executor.submit(self._heartbeat_loop)
-        self._merge_contacts()
+    def _init_sockets(self) -> None:
+        try:
+            # UDP
+            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.udp_sock.bind(('', self.broadcast_port))
+            self.udp_sock.settimeout(1.0)
 
-    def _merge_contacts(self):
-        db_contacts = {mid: nick for mid, nick in self.db.get_all_contacts() if mid != MY_MACHINE_ID}
-        combined = {}
-        now = time.time()
-        for mid, nick in db_contacts.items():
-            if mid in self.peers:
-                ips, nick_net, last_hello, cp, fp = self.peers[mid]
-                combined[mid] = (ips, nick_net, last_hello, cp, fp)
-            else:
-                combined[mid] = ([], nick, 0, 0, 0)
-        for mid, (ips, nick_net, last_hello, cp, fp) in self.peers.items():
-            if mid not in combined:
-                combined[mid] = (ips, nick_net, last_hello, cp, fp)
-        self.contact_update.emit(combined)
+            # TCP chat
+            self.chat_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.chat_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.chat_server_sock.bind(('0.0.0.0', self.chat_port))
+            self.chat_server_sock.listen(5)
+            self.chat_server_sock.settimeout(1.0)
 
-    def _start_udp_listener(self):
-        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.udp_sock.bind(('', self.broadcast_port))
-        self.udp_sock.settimeout(1.0)
-        executor.submit(self._udp_listener)
+            # TCP files
+            self.file_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.file_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.file_server_sock.bind(('0.0.0.0', self.file_port))
+            self.file_server_sock.listen(5)
+            self.file_server_sock.settimeout(1.0)
+        except Exception:
+            logger.exception("Failed to initialize sockets")
+            raise
 
-    def _start_chat_server(self):
-        self.chat_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.chat_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.chat_server_sock.bind(('0.0.0.0', self.chat_port))
-        self.chat_server_sock.listen(5)
-        self.chat_server_sock.settimeout(1.0)
-        executor.submit(self._chat_server_loop)
+    def _start_threads(self) -> None:
+        t_udp = threading.Thread(target=self._udp_listener, name="UDPListener")
+        t_chat = threading.Thread(target=self._chat_server_loop, name="ChatServer")
+        t_file = threading.Thread(target=self._file_server_loop, name="FileServer")
+        t_heart = threading.Thread(target=self._heartbeat_loop, name="Heartbeat")
+        for t in (t_udp, t_chat, t_file, t_heart):
+            t.daemon = False
+            t.start()
+            self.threads.append(t)
 
-    def _start_file_server(self):
-        self.file_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.file_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.file_server_sock.bind(('0.0.0.0', self.file_port))
-        self.file_server_sock.listen(5)
-        self.file_server_sock.settimeout(1.0)
-        executor.submit(self._file_server_loop)
-
-    def stop(self):
+    def shutdown(self) -> None:
+        """Centralized shutdown sequence."""
+        logger.info("Shutting down network core")
         self.running = False
-        safe_close(self.udp_sock)
-        safe_close(self.chat_server_sock)
-        safe_close(self.file_server_sock)
-        with self.lock:
-            for sock in self.connections.values():
-                safe_close(sock)
+
+        # 1. Close all listening sockets to unblock threads
+        safe_close_socket(self.udp_sock)
+        safe_close_socket(self.chat_server_sock)
+        safe_close_socket(self.file_server_sock)
+
+        # 2. Close peer connections
+        with self.state_lock:
+            for sock in list(self.connections.values()):
+                safe_close_socket(sock)
             self.connections.clear()
 
-    def _send_hello(self):
+        # 3. Join threads with timeout
+        for t in self.threads:
+            if t.is_alive():
+                t.join(timeout=2)
+            if t.is_alive():
+                logger.warning(f"Thread {t.name} did not terminate")
+
+        logger.info("Shutdown complete")
+
+    # -------- UDP DISCOVERY --------
+    def _send_hello(self) -> None:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -455,111 +506,127 @@ class NetworkCore(QObject):
             })
             sock.sendto(msg.encode(), ('255.255.255.255', self.broadcast_port))
             sock.close()
-        except Exception as e:
-            logger.error(f"send_hello error: {e}")
+        except Exception:
+            logger.exception("send_hello failed")
 
-    def _validate_message(self, data, required_type=None):
-        if 'type' not in data:
-            return False
-        msg_type = data['type']
-        if required_type and msg_type != required_type:
-            return False
-        needed = REQUIRED_KEYS.get(msg_type, [])
-        for key in needed:
-            if key not in data:
-                logger.warning(f"Missing key '{key}' in message type {msg_type}")
-                return False
-        return True
-
-    def _validate_hello(self, msg):
-        if not self.room_hash:
-            return True
-        return msg.get('room_hash') == self.room_hash
-
-    def _udp_listener(self):
+    def _udp_listener(self) -> None:
         while self.running:
             try:
-                data, addr = self.udp_sock.recvfrom(4096)
-                try:
-                    msg = json.loads(data.decode())
-                except:
-                    continue
-                if not self._validate_message(msg):
-                    continue
-                msg_type = msg.get('type')
-                if msg_type == 'HELLO':
-                    if not self._validate_hello(msg):
-                        continue
-                    peer_id = msg['machine_id']
-                    if peer_id == MY_MACHINE_ID:
-                        continue
-                    peer_nick = msg['nickname']
-                    peer_chat_port = msg.get('chat_port', self.chat_port)
-                    peer_file_port = msg.get('file_port', self.file_port)
-                    peer_ips = msg.get('ips', [addr[0]])
-                    with self.lock:
-                        if peer_id in self.peers:
-                            old_ips = set(self.peers[peer_id][0])
-                            new_ips = set(peer_ips)
-                            if old_ips and old_ips != new_ips:
-                                logger.warning(f"Machine {peer_id} ({peer_nick}) changed IP from {old_ips} to {new_ips}")
-                        self.peers[peer_id] = (peer_ips, peer_nick, time.time(), peer_chat_port, peer_file_port)
-                        self.last_pong[peer_id] = time.time()
-                    self.db.add_contact(peer_id, peer_nick)
-                    self._merge_contacts()
-                    if peer_id not in self.connections:
-                        self._try_connect_to_peer(peer_id, peer_ips, peer_chat_port)
-                elif msg_type == 'PING':
-                    pong = json.dumps({'type': 'PONG', 'machine_id': MY_MACHINE_ID})
-                    self.udp_sock.sendto(pong.encode(), addr)
-                elif msg_type == 'PONG':
-                    peer_id = msg['machine_id']
-                    if peer_id != MY_MACHINE_ID:
-                        self.last_pong[peer_id] = time.time()
+                data, addr = self.udp_sock.recvfrom(UDP_BUFFER_SIZE)
+                self._process_udp_packet(data, addr)
             except socket.timeout:
                 continue
-            except Exception as e:
-                if self.running:
-                    logger.error(f"UDP error: {e}")
+            except OSError:
+                break
+            except Exception:
+                logger.exception("UDP listener error")
+                break
 
-    def _heartbeat_loop(self):
+    def _process_udp_packet(self, data: bytes, addr: Tuple[str, int]) -> None:
+        try:
+            msg = json.loads(data.decode())
+        except json.JSONDecodeError:
+            logger.warning("Invalid UDP JSON")
+            return
+        except Exception:
+            logger.exception("Unexpected UDP parsing error")
+            return
+
+        if not self._validate_message(msg):
+            return
+
+        msg_type = msg.get('type')
+        if msg_type == 'HELLO':
+            self._handle_hello_packet(msg, addr)
+        elif msg_type == 'PING':
+            self._handle_ping_packet(addr)
+        elif msg_type == 'PONG':
+            self._handle_pong_packet(msg)
+
+    def _handle_hello_packet(self, msg: dict, addr: Tuple[str, int]) -> None:
+        if not self._validate_hello(msg):
+            return
+        peer_id = msg['machine_id']
+        if peer_id == MY_MACHINE_ID:
+            return
+        peer_nick = msg['nickname']
+        peer_chat_port = msg.get('chat_port', self.chat_port)
+        peer_file_port = msg.get('file_port', self.file_port)
+        peer_ips = msg.get('ips', [addr[0]])
+
+        with self.state_lock:
+            if peer_id in self.peers:
+                old_ips = set(self.peers[peer_id][0])
+                new_ips = set(peer_ips)
+                if old_ips and old_ips != new_ips:
+                    logger.warning(f"Machine {peer_id} ({peer_nick}) changed IP from {old_ips} to {new_ips}")
+            self.peers[peer_id] = (peer_ips, peer_nick, time.time(), peer_chat_port, peer_file_port)
+            self.last_pong[peer_id] = time.time()
+
+        self.db.add_contact(peer_id, peer_nick)
+        self._merge_contacts()
+        if peer_id not in self.connections:
+            self._try_connect_to_peer(peer_id, peer_ips, peer_chat_port)
+
+    def _handle_ping_packet(self, addr: Tuple[str, int]) -> None:
+        pong = json.dumps({'type': 'PONG', 'machine_id': MY_MACHINE_ID})
+        try:
+            self.udp_sock.sendto(pong.encode(), addr)
+        except Exception:
+            logger.exception("PONG send failed")
+
+    def _handle_pong_packet(self, msg: dict) -> None:
+        peer_id = msg['machine_id']
+        if peer_id != MY_MACHINE_ID:
+            with self.state_lock:
+                self.last_pong[peer_id] = time.time()
+
+    # -------- HEARTBEAT --------
+    def _heartbeat_loop(self) -> None:
         while self.running:
-            time.sleep(config.get('heartbeat_interval', 3))
+            time.sleep(config.get('heartbeat_interval', HEARTBEAT_INTERVAL))
             now = time.time()
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             ping_msg = json.dumps({'type': 'PING', 'machine_id': MY_MACHINE_ID})
-            sock.sendto(ping_msg.encode(), ('255.255.255.255', self.broadcast_port))
-            sock.close()
-            timeout = config.get('heartbeat_timeout', 9)
-            with self.lock:
+            try:
+                sock.sendto(ping_msg.encode(), ('255.255.255.255', self.broadcast_port))
+            except Exception:
+                logger.exception("PING broadcast failed")
+            finally:
+                sock.close()
+
+            timeout = config.get('heartbeat_timeout', HEARTBEAT_TIMEOUT)
+            with self.state_lock:
                 for peer_id in list(self.connections.keys()):
                     last = self.last_pong.get(peer_id, 0)
                     if now - last > timeout:
                         logger.info(f"Heartbeat timeout for {peer_id}, closing")
-                        safe_close(self.connections[peer_id])
+                        safe_close_socket(self.connections[peer_id])
                         del self.connections[peer_id]
                         self.connection_state_changed.emit(peer_id, False)
                         self.reconnect_requested.emit(peer_id)
             self._merge_contacts()
 
-    def _try_reconnect(self, peer_id):
-        if peer_id in self.connections or not self.running:
-            return
-        with self.lock:
-            if peer_id not in self.peers:
-                return
-            ips, _, _, chat_port, _ = self.peers[peer_id]
-        logger.info(f"Reconnecting to {peer_id} ({ips}:{chat_port})")
-        self._try_connect_to_peer(peer_id, ips, chat_port)
-        if peer_id in self.connections:
-            self.reconnect_attempts[peer_id] = 0
-        else:
-            self.reconnect_attempts[peer_id] += 1
-            if self.reconnect_attempts[peer_id] < 5:
-                self.reconnect_requested.emit(peer_id)
+    # -------- CONNECTION MANAGEMENT --------
+    def _merge_contacts(self) -> None:
+        db_contacts = {mid: nick for mid, nick in self.db.get_all_contacts() if mid != MY_MACHINE_ID}
+        combined = {}
+        now = time.time()
+        with self.state_lock:
+            peers_snapshot = dict(self.peers)
+        for mid, nick in db_contacts.items():
+            if mid in peers_snapshot:
+                ips, nick_net, last_hello, cp, fp = peers_snapshot[mid]
+                combined[mid] = (ips, nick_net, last_hello, cp, fp)
+            else:
+                combined[mid] = ([], nick, 0, 0, 0)
+        for mid, (ips, nick_net, last_hello, cp, fp) in peers_snapshot.items():
+            if mid not in combined:
+                combined[mid] = (ips, nick_net, last_hello, cp, fp)
+        self.contact_update.emit(combined)
 
-    def _try_connect_to_peer(self, peer_id, ips, chat_port):
+    def _try_connect_to_peer(self, peer_id: str, ips: List[str], chat_port: int) -> None:
         for ip in ips:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2.0)
@@ -567,20 +634,23 @@ class NetworkCore(QObject):
                 sock.connect((ip, chat_port))
             except Exception as e:
                 logger.warning(f"Connect to {ip}:{chat_port} failed: {e}")
-                safe_close(sock)
+                safe_close_socket(sock)
                 continue
-            with self.lock:
+
+            with self.state_lock:
                 if peer_id in self.connections:
-                    safe_close(sock)
+                    safe_close_socket(sock)
                     return
                 self.connections[peer_id] = sock
+                self.last_pong[peer_id] = time.time()
+
             sock.settimeout(30)
             executor.submit(self._chat_receiver, sock, peer_id)
             self._send_identity(sock)
             self._send_pending_messages(peer_id)
             return
 
-    def _send_identity(self, sock):
+    def _send_identity(self, sock: socket.socket) -> None:
         identity = json.dumps({
             'type': 'identity',
             'machine_id': MY_MACHINE_ID,
@@ -589,58 +659,95 @@ class NetworkCore(QObject):
         })
         self._send_frame(sock, identity)
 
-    def _chat_server_loop(self):
+    def _try_reconnect(self, peer_id: str) -> None:
+        with self.state_lock:
+            if peer_id in self.connections or not self.running:
+                return
+            if self.reconnecting.get(peer_id, False):
+                return
+            self.reconnecting[peer_id] = True
+            if peer_id not in self.peers:
+                return
+            ips, _, _, chat_port, _ = self.peers[peer_id]
+
+        logger.info(f"Reconnecting to {peer_id} ({ips}:{chat_port})")
+        self._try_connect_to_peer(peer_id, ips, chat_port)
+
+        with self.state_lock:
+            if peer_id in self.connections:
+                self.reconnect_attempts[peer_id] = 0
+            else:
+                self.reconnect_attempts[peer_id] += 1
+                if self.reconnect_attempts[peer_id] < MAX_RECONNECT_ATTEMPTS:
+                    self.reconnect_requested.emit(peer_id)
+            self.reconnecting[peer_id] = False
+
+    # -------- CHAT SERVER --------
+    def _chat_server_loop(self) -> None:
         while self.running:
             try:
                 client_sock, addr = self.chat_server_sock.accept()
-                with self.lock:
+                with self.state_lock:
                     if len(self.connections) >= MAX_CONNECTIONS:
-                        safe_close(client_sock)
+                        safe_close_socket(client_sock)
                         continue
                 client_sock.settimeout(30)
-                identity = self._recv_frame(client_sock)
-                if not identity:
-                    safe_close(client_sock)
-                    continue
-                try:
-                    data = json.loads(identity)
-                except:
-                    safe_close(client_sock)
-                    continue
-                if data.get('type') == 'identity':
-                    if self.room_hash and data.get('room_hash') != self.room_hash:
-                        logger.warning("Connection rejected: room_hash mismatch")
-                        safe_close(client_sock)
-                        continue
-                    peer_id = data['machine_id']
-                    peer_nick = data['nickname']
-                else:
-                    if not self._validate_message(data):
-                        safe_close(client_sock)
-                        continue
-                    peer_id = data['machine_id']
-                    peer_nick = data.get('nickname', 'Unknown')
-                with self.lock:
-                    if peer_id in self.connections:
-                        safe_close(client_sock)
-                        continue
-                    self.connections[peer_id] = client_sock
-                    if peer_id not in self.peers:
-                        self.peers[peer_id] = ([addr[0]], peer_nick, time.time(), self.chat_port, self.file_port)
-                    else:
-                        ips, _, _, _, _ = self.peers[peer_id]
-                        self.peers[peer_id] = (ips, peer_nick, time.time(), self.chat_port, self.file_port)
-                    self.last_pong[peer_id] = time.time()
-                self._merge_contacts()
-                executor.submit(self._chat_receiver, client_sock, peer_id)
-                self._send_pending_messages(peer_id)
+                self._handle_incoming_connection(client_sock, addr)
             except socket.timeout:
                 continue
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Chat server error: {e}")
+            except OSError:
+                break
+            except Exception:
+                logger.exception("Chat server error")
+                break
 
-    def _chat_receiver(self, sock, peer_id):
+    def _handle_incoming_connection(self, client_sock: socket.socket, addr: Tuple[str, int]) -> None:
+        identity = self._recv_frame(client_sock)
+        if not identity:
+            safe_close_socket(client_sock)
+            return
+        try:
+            data = json.loads(identity)
+        except json.JSONDecodeError:
+            logger.warning("Invalid identity JSON")
+            safe_close_socket(client_sock)
+            return
+        except Exception:
+            logger.exception("Unexpected identity parsing error")
+            safe_close_socket(client_sock)
+            return
+
+        if data.get('type') == 'identity':
+            if self.room_hash and data.get('room_hash') != self.room_hash:
+                logger.warning("Connection rejected: room_hash mismatch")
+                safe_close_socket(client_sock)
+                return
+            peer_id = data['machine_id']
+            peer_nick = data['nickname']
+        else:
+            if not self._validate_message(data):
+                safe_close_socket(client_sock)
+                return
+            peer_id = data['machine_id']
+            peer_nick = data.get('nickname', 'Unknown')
+
+        with self.state_lock:
+            if peer_id in self.connections:
+                safe_close_socket(client_sock)
+                return
+            self.connections[peer_id] = client_sock
+            if peer_id not in self.peers:
+                self.peers[peer_id] = ([addr[0]], peer_nick, time.time(), self.chat_port, self.file_port)
+            else:
+                ips, _, _, _, _ = self.peers[peer_id]
+                self.peers[peer_id] = (ips, peer_nick, time.time(), self.chat_port, self.file_port)
+            self.last_pong[peer_id] = time.time()
+
+        self._merge_contacts()
+        executor.submit(self._chat_receiver, client_sock, peer_id)
+        self._send_pending_messages(peer_id)
+
+    def _chat_receiver(self, sock: socket.socket, peer_id: str) -> None:
         while self.running:
             try:
                 data_str = self._recv_frame(sock)
@@ -648,91 +755,113 @@ class NetworkCore(QObject):
                     break
                 try:
                     data = json.loads(data_str)
-                except:
+                except json.JSONDecodeError:
+                    logger.warning("Invalid chat JSON")
                     continue
+                except Exception:
+                    logger.exception("Chat receiver parsing error")
+                    continue
+
                 if not self._validate_message(data):
                     continue
                 self._process_message(peer_id, data)
             except socket.timeout:
                 continue
-            except Exception as e:
-                logger.warning(f"Chat receiver error for {peer_id}: {e}")
+            except OSError:
                 break
-        with self.lock:
+            except Exception:
+                logger.exception(f"Chat receiver error for {peer_id}")
+                break
+
+        with self.state_lock:
             if peer_id in self.connections and self.connections[peer_id] == sock:
                 del self.connections[peer_id]
-        safe_close(sock)
+        safe_close_socket(sock)
         self._merge_contacts()
         if self.running:
             self.reconnect_requested.emit(peer_id)
 
-    def _process_message(self, peer_id, data):
+    def _process_message(self, peer_id: str, data: dict) -> None:
         msg_type = data.get('type')
         if msg_type == 'text':
-            sender_nick = self.peers.get(peer_id, ('', 'Unknown'))[1]
-            message = data['message']
-            self.db.save_message(peer_id, sender_nick, MY_MACHINE_ID, message)
-            self.db.increment_unread(peer_id)
-            self.message_received.emit(peer_id, sender_nick, message, '', '', False)
+            self._handle_text_message(peer_id, data)
         elif msg_type == 'file_request':
-            file_name = data['file_name']
-            file_size = data['file_size']
-            request_id = data['request_id']
-            is_folder = data.get('is_folder', False)
-            sender_nick = self.peers.get(peer_id, ('', 'Unknown'))[1]
-            self.file_request_received.emit(peer_id, sender_nick, file_name, file_size, request_id, is_folder)
+            self._handle_file_request_message(peer_id, data)
         elif msg_type == 'file_accept':
             request_id = data['request_id']
             self._send_file_to(peer_id, request_id)
         elif msg_type == 'file_reject':
             request_id = data['request_id']
-            with self.lock:
+            with self.state_lock:
                 self.offered_files.pop(request_id, None)
         elif msg_type == 'nickname_change':
-            new_nick = data['new_nick']
-            with self.lock:
-                if peer_id in self.peers:
-                    ips, _, last, cp, fp = self.peers[peer_id]
-                    self.peers[peer_id] = (ips, new_nick, last, cp, fp)
-            self.db.add_contact(peer_id, new_nick)
-            self._merge_contacts()
+            self._handle_nickname_change(peer_id, data)
 
-    def send_message(self, peer_id, text):
-        with self.lock:
+    def _handle_text_message(self, peer_id: str, data: dict) -> None:
+        sender_nick = self.peers.get(peer_id, ('', 'Unknown'))[1]
+        message = data['message']
+        self.db.save_message(peer_id, sender_nick, MY_MACHINE_ID, message)
+        self.db.increment_unread(peer_id)
+        self.message_received.emit(peer_id, sender_nick, message, '', '', False)
+
+    def _handle_file_request_message(self, peer_id: str, data: dict) -> None:
+        file_name = data['file_name']
+        file_size = data['file_size']
+        request_id = data['request_id']
+        is_folder = data.get('is_folder', False)
+        sender_nick = self.peers.get(peer_id, ('', 'Unknown'))[1]
+        self.file_request_received.emit(peer_id, sender_nick, file_name, file_size, request_id, is_folder)
+
+    def _handle_nickname_change(self, peer_id: str, data: dict) -> None:
+        new_nick = data['new_nick']
+        with self.state_lock:
+            if peer_id in self.peers:
+                ips, _, last, cp, fp = self.peers[peer_id]
+                self.peers[peer_id] = (ips, new_nick, last, cp, fp)
+        self.db.add_contact(peer_id, new_nick)
+        self._merge_contacts()
+
+    # -------- MESSAGING --------
+    def send_message(self, peer_id: str, text: str) -> bool:
+        with self.state_lock:
             sock = self.connections.get(peer_id)
-            if not sock:
-                self.db.save_message(MY_MACHINE_ID, self.nickname, peer_id, text, pending=1)
-                return True
-            try:
-                self._send_frame(sock, json.dumps({'type': 'text', 'message': text}))
-                self.db.save_message(MY_MACHINE_ID, self.nickname, peer_id, text)
-                return True
-            except:
+        if not sock:
+            self.db.save_message(MY_MACHINE_ID, self.nickname, peer_id, text, pending=1)
+            return True
+        try:
+            self._send_frame(sock, json.dumps({'type': 'text', 'message': text}))
+            self.db.save_message(MY_MACHINE_ID, self.nickname, peer_id, text)
+            return True
+        except Exception:
+            logger.exception(f"Send message to {peer_id} failed")
+            with self.state_lock:
                 self.connections.pop(peer_id, None)
-                self.db.save_message(MY_MACHINE_ID, self.nickname, peer_id, text, pending=1)
-                return True
+            self.db.save_message(MY_MACHINE_ID, self.nickname, peer_id, text, pending=1)
+            return True
 
-    def _send_message_raw(self, peer_id, text):
-        with self.lock:
+    def _send_message_raw(self, peer_id: str, text: str) -> bool:
+        with self.state_lock:
             sock = self.connections.get(peer_id)
-            if not sock:
-                return False
-            try:
-                self._send_frame(sock, json.dumps({'type': 'text', 'message': text}))
-                return True
-            except:
+        if not sock:
+            return False
+        try:
+            self._send_frame(sock, json.dumps({'type': 'text', 'message': text}))
+            return True
+        except Exception:
+            logger.exception(f"Raw send to {peer_id} failed")
+            with self.state_lock:
                 self.connections.pop(peer_id, None)
-                return False
+            return False
 
-    def send_file_request(self, peer_id, file_path, is_folder=False):
-        with self.lock:
+    def send_file_request(self, peer_id: str, file_path: str, is_folder: bool = False) -> bool:
+        with self.state_lock:
             sock = self.connections.get(peer_id)
         if not sock:
             return False
         request_id = str(uuid.uuid4())
         file_name = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
-        with self.lock:
+        with self.state_lock:
             self.offered_files[request_id] = (file_path, MY_MACHINE_ID, is_folder)
         msg = json.dumps({
             'type': 'file_request',
@@ -745,72 +874,80 @@ class NetworkCore(QObject):
             self._send_frame(sock, msg)
             threading.Timer(60.0, lambda rid=request_id: self._cleanup_offer(rid)).start()
             return True
-        except:
-            with self.lock:
+        except Exception:
+            logger.exception(f"Send file request to {peer_id} failed")
+            with self.state_lock:
                 self.offered_files.pop(request_id, None)
             return False
 
-    def _cleanup_offer(self, request_id):
-        with self.lock:
+    def _cleanup_offer(self, request_id: str) -> None:
+        with self.state_lock:
             self.offered_files.pop(request_id, None)
 
-    def _send_file_to(self, receiver_id, request_id):
-        with self.lock:
+    # -------- FILE TRANSFER --------
+    def _send_file_to(self, receiver_id: str, request_id: str) -> None:
+        with self.state_lock:
             info = self.offered_files.pop(request_id, None)
         if not info:
             return
         file_path, sender_id, is_folder = info
-        with self.lock:
+        with self.state_lock:
             if receiver_id not in self.peers:
                 return
             peer_ips, _, _, _, file_port = self.peers[receiver_id]
         if not peer_ips or file_port == 0:
             self.file_transfer_failed.emit(receiver_id, "Неизвестный IP или порт получателя")
             return
+
         file_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        file_sock.settimeout(10)
+        file_sock.settimeout(TRANSFER_TIMEOUT)
         connected = False
         for ip in peer_ips:
             try:
                 file_sock.connect((ip, file_port))
                 connected = True
                 break
-            except:
+            except Exception:
                 continue
         if not connected:
             self.file_transfer_failed.emit(receiver_id, "Не удалось подключиться для передачи файла")
+            safe_close_socket(file_sock)
             return
+
         try:
             preamble = json.dumps({'request_id': request_id, 'sender_id': sender_id, 'is_folder': is_folder})
-            self._send_exact(file_sock, preamble.encode().ljust(128))
+            self._send_exact(file_sock, preamble.encode().ljust(MAX_PREAMBLE_SIZE))
             header = json.dumps({'file_name': os.path.basename(file_path), 'file_size': os.path.getsize(file_path)})
-            self._send_exact(file_sock, header.encode().ljust(512))
+            self._send_exact(file_sock, header.encode().ljust(MAX_HEADER_SIZE))
+
             with open(file_path, 'rb') as f:
-                while chunk := f.read(8192):
+                while chunk := f.read(BUFFER_SIZE):
                     file_sock.sendall(chunk)
-        except Exception as e:
-            logger.error(f"File send error: {e}")
-            self.file_transfer_failed.emit(receiver_id, f"Ошибка при отправке файла: {e}")
+        except Exception:
+            logger.exception(f"File send error to {receiver_id}")
+            self.file_transfer_failed.emit(receiver_id, f"Ошибка при отправке файла")
         finally:
-            safe_close(file_sock)
+            safe_close_socket(file_sock)
             if is_folder and file_path.startswith(tempfile.gettempdir()):
                 try:
                     os.remove(file_path)
-                except:
-                    pass
+                except Exception:
+                    logger.exception("Failed to remove temp archive")
 
-    def _file_server_loop(self):
+    def _file_server_loop(self) -> None:
         while self.running:
             try:
                 client_sock, addr = self.file_server_sock.accept()
                 executor.submit(self._handle_incoming_file, client_sock)
             except socket.timeout:
                 continue
-            except Exception as e:
-                if self.running:
-                    logger.error(f"File server error: {e}")
+            except OSError:
+                break
+            except Exception:
+                logger.exception("File server error")
+                break
 
-    def _safe_extract_zip(self, zip_path, extract_dir):
+    def _safe_extract_zip(self, zip_path: str, extract_dir: str) -> None:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for member in zf.infolist():
                 member_path = os.path.abspath(os.path.join(extract_dir, member.filename))
@@ -818,26 +955,36 @@ class NetworkCore(QObject):
                     raise Exception(f"Zip traversal attempt: {member.filename}")
             zf.extractall(extract_dir)
 
-    def _handle_incoming_file(self, sock):
-        sock.settimeout(30)
+    def _handle_incoming_file(self, sock: socket.socket) -> None:
+        sock.settimeout(TRANSFER_TIMEOUT)
         try:
-            preamble_data = self._recv_exact(sock, 128)
+            preamble_data = self._recv_exact(sock, MAX_PREAMBLE_SIZE)
             try:
                 preamble = json.loads(preamble_data.decode().strip())
-            except:
+            except json.JSONDecodeError:
+                logger.warning("Invalid file preamble JSON")
                 return
+            except Exception:
+                logger.exception("Error parsing file preamble")
+                return
+
             if not all(k in preamble for k in ('request_id', 'sender_id')):
-                logger.warning("Invalid preamble")
+                logger.warning("Missing fields in preamble")
                 return
             request_id = preamble['request_id']
             sender_id = preamble['sender_id']
             is_folder = preamble.get('is_folder', False)
 
-            header_data = self._recv_exact(sock, 512)
+            header_data = self._recv_exact(sock, MAX_HEADER_SIZE)
             try:
                 header = json.loads(header_data.decode().strip())
-            except:
+            except json.JSONDecodeError:
+                logger.warning("Invalid file header JSON")
                 return
+            except Exception:
+                logger.exception("Error parsing file header")
+                return
+
             if not all(k in header for k in ('file_name', 'file_size')):
                 return
             file_name = header['file_name']
@@ -855,14 +1002,18 @@ class NetworkCore(QObject):
             os.makedirs(download_dir, exist_ok=True)
             save_path = os.path.join(download_dir, safe_name)
             received = 0
+            last_progress = time.time()
             with open(save_path, 'wb') as f:
                 while received < file_size:
-                    chunk = sock.recv(min(8192, file_size - received))
+                    chunk = sock.recv(min(BUFFER_SIZE, file_size - received))
                     if not chunk:
                         break
                     f.write(chunk)
                     received += len(chunk)
                     self.file_progress.emit(file_name, received, file_size)
+                    if time.time() - last_progress > TRANSFER_PROGRESS_TIMEOUT:
+                        raise socket.timeout("Transfer stalled")
+                    last_progress = time.time()
 
             if is_folder and safe_name.lower().endswith('.zip'):
                 folder_name = safe_name[:-4]
@@ -874,8 +1025,8 @@ class NetworkCore(QObject):
                     final_path = extract_dir
                     final_name = folder_name
                     is_folder_flag = True
-                except Exception as e:
-                    logger.error(f"Zip extract error: {e}")
+                except Exception:
+                    logger.exception(f"Zip extract error for {save_path}")
                     final_path = save_path
                     final_name = safe_name
                     is_folder_flag = False
@@ -884,30 +1035,33 @@ class NetworkCore(QObject):
                 final_name = safe_name
                 is_folder_flag = False
 
-            with self.lock:
+            with self.state_lock:
                 nick = self.peers.get(sender_id, ('', 'Unknown'))[1]
             self.db.save_message(sender_id, nick, MY_MACHINE_ID,
                                  f"Получен файл: {final_name}", final_name, final_path,
                                  is_folder=1 if is_folder_flag else 0)
             self.db.increment_unread(sender_id)
             self.message_received.emit(sender_id, nick, '', final_name, final_path, is_folder_flag)
-        except Exception as e:
-            logger.error(f"File receive error: {e}")
+        except socket.timeout:
+            logger.warning("File transfer timed out")
+        except Exception:
+            logger.exception("File receive error")
         finally:
-            safe_close(sock)
+            safe_close_socket(sock)
 
-    def _send_frame(self, sock, plain: str):
+    # -------- PROTOCOL HELPERS --------
+    def _send_frame(self, sock: socket.socket, plain: str) -> None:
         data = plain.encode()
         length = len(data)
         sock.sendall(struct.pack('!I', length))
         sock.sendall(data)
 
-    def _recv_frame(self, sock):
+    def _recv_frame(self, sock: socket.socket) -> Optional[str]:
         raw = sock.recv(4)
         if len(raw) < 4:
             return None
         length = struct.unpack('!I', raw)[0]
-        if length > 10 * 1024 * 1024:
+        if length > MAX_MESSAGE_SIZE:
             raise ValueError("Сообщение слишком большое")
         data = bytearray()
         while len(data) < length:
@@ -917,10 +1071,10 @@ class NetworkCore(QObject):
             data.extend(packet)
         return data.decode()
 
-    def _send_exact(self, sock, data: bytes):
+    def _send_exact(self, sock: socket.socket, data: bytes) -> None:
         sock.sendall(data)
 
-    def _recv_exact(self, sock, n: int) -> bytes:
+    def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
         data = bytearray()
         while len(data) < n:
             packet = sock.recv(n - len(data))
@@ -929,22 +1083,42 @@ class NetworkCore(QObject):
             data.extend(packet)
         return bytes(data)
 
-    def update_nickname(self, new_nick):
+    def _validate_message(self, data: dict, required_type: str = None) -> bool:
+        if 'type' not in data:
+            return False
+        msg_type = data['type']
+        if required_type and msg_type != required_type:
+            return False
+        needed = REQUIRED_KEYS.get(msg_type, [])
+        for key in needed:
+            if key not in data:
+                logger.warning(f"Missing key '{key}' in message type {msg_type}")
+                return False
+        return True
+
+    def _validate_hello(self, msg: dict) -> bool:
+        if not self.room_hash:
+            return True
+        return msg.get('room_hash') == self.room_hash
+
+    def update_nickname(self, new_nick: str) -> None:
         self.nickname = new_nick
         self.db.set_nickname(new_nick)
         msg = json.dumps({'type': 'nickname_change', 'new_nick': new_nick})
-        with self.lock:
+        with self.state_lock:
             for pid, sock in list(self.connections.items()):
                 try:
                     self._send_frame(sock, msg)
-                except:
+                except Exception:
+                    logger.exception(f"Nickname update failed for {pid}")
                     self.connections.pop(pid, None)
-        if MY_MACHINE_ID in self.peers:
-            ips, _, last, cp, fp = self.peers[MY_MACHINE_ID]
-            self.peers[MY_MACHINE_ID] = (ips, new_nick, last, cp, fp)
+        with self.state_lock:
+            if MY_MACHINE_ID in self.peers:
+                ips, _, last, cp, fp = self.peers[MY_MACHINE_ID]
+                self.peers[MY_MACHINE_ID] = (ips, new_nick, last, cp, fp)
         self._merge_contacts()
 
-    def _send_pending_messages(self, peer_id):
+    def _send_pending_messages(self, peer_id: str) -> None:
         pending = self.db.get_pending_messages(peer_id)
         for msg_id, text, file_name, file_path, is_folder in pending:
             if file_name:
@@ -953,11 +1127,9 @@ class NetworkCore(QObject):
                 if self._send_message_raw(peer_id, text):
                     self.db.mark_sent(msg_id)
 
-# ----------------------------------------------------------------------
-# GUI
-# ----------------------------------------------------------------------
+# ====================== GUI ======================
 class ChatDisplay(QTextEdit):
-    file_dropped = pyqtSignal(str, bool)  # file_path, is_folder
+    file_dropped = pyqtSignal(str, bool)
     history_scroll = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -966,19 +1138,19 @@ class ChatDisplay(QTextEdit):
         self.setReadOnly(True)
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
-    def _on_scroll(self, value):
+    def _on_scroll(self, value: int) -> None:
         if value <= self.verticalScrollBar().minimum() + 10:
             self.history_scroll.emit()
 
-    def dragEnterEvent(self, event: QDragEnterEvent):
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
-    def dragMoveEvent(self, event: QDragMoveEvent):
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
-    def dropEvent(self, event: QDropEvent):
+    def dropEvent(self, event: QDropEvent) -> None:
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 path = url.toLocalFile()
@@ -1009,7 +1181,7 @@ class NicknameDialog(QDialog):
         layout.addRow(buttons)
         self.setLayout(layout)
 
-    def get_nickname(self):
+    def get_nickname(self) -> str:
         return self.nick_edit.text().strip()
 
 class SettingsDialog(QDialog):
@@ -1051,24 +1223,24 @@ class SettingsDialog(QDialog):
         layout.addRow(buttons)
         self.setLayout(layout)
 
-    def load_config(self):
+    def load_config(self) -> None:
         self.bport.setValue(config.get('broadcast_port',0))
         self.cport.setValue(config.get('chat_port',0))
         self.fport.setValue(config.get('file_port',0))
         self.max_mb.setValue(config.get('max_file_mb',500))
         self.history_days.setValue(config.get('history_days',90))
         self.key_path.setText(config.get('encryption_key_path',''))
-        self.heartbeat_int.setValue(config.get('heartbeat_interval',3))
-        self.heartbeat_timeout.setValue(config.get('heartbeat_timeout',9))
+        self.heartbeat_int.setValue(config.get('heartbeat_interval', HEARTBEAT_INTERVAL))
+        self.heartbeat_timeout.setValue(config.get('heartbeat_timeout', HEARTBEAT_TIMEOUT))
         self.download_path.setText(config.get('download_path', DEFAULT_DOWNLOADS_DIR))
         self.shared_secret.setText('')
 
-    def browse_download_path(self):
+    def browse_download_path(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку для загрузок", self.download_path.text())
         if folder:
             self.download_path.setText(folder)
 
-    def save_and_accept(self):
+    def save_and_accept(self) -> None:
         config['broadcast_port'] = self.bport.value()
         config['chat_port'] = self.cport.value()
         config['file_port'] = self.fport.value()
@@ -1089,7 +1261,7 @@ class SettingsDialog(QDialog):
         self.accept()
 
 class DiagnosticsWidget(QWidget):
-    def __init__(self, net, parent=None):
+    def __init__(self, net: NetworkCore, parent=None):
         super().__init__(parent)
         self.net = net
         layout = QVBoxLayout()
@@ -1105,7 +1277,7 @@ class DiagnosticsWidget(QWidget):
         self.setLayout(layout)
         self.refresh()
 
-    def refresh(self):
+    def refresh(self) -> None:
         info = (
             f"Мой IP: {self.net.local_ips}\n"
             f"Broadcast порт: {self.net.broadcast_port}\n"
@@ -1121,19 +1293,19 @@ class DiagnosticsWidget(QWidget):
             with open(LOG_PATH, 'r') as f:
                 lines = f.readlines()[-30:]
                 self.log_text.setPlainText(''.join(lines))
-        except:
+        except Exception:
             pass
 
 class MainWindow(QMainWindow):
-    def __init__(self, db, nickname, broad_port, chat_port, file_port):
+    def __init__(self, db: ChatDatabase, nickname: str, broad_port: int, chat_port: int, file_port: int):
         super().__init__()
         self.db = db
         self.nickname = nickname
         self.setWindowTitle(f"MestoChat — {html.escape(nickname)}")
         self.setMinimumSize(900, 600)
-        self.current_peer = None
-        self.unread_counts = defaultdict(int)
-        self.history_offset = {}
+        self.current_peer: Optional[str] = None
+        self.unread_counts: Dict[str, int] = defaultdict(int)
+        self.history_offset: Dict[str, Optional[int]] = {}
 
         stored_hash = config.get('shared_secret_hash', '')
         room_hash = ''
@@ -1181,14 +1353,14 @@ class MainWindow(QMainWindow):
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
 
-    def schedule_reconnect(self, peer_id):
+    def schedule_reconnect(self, peer_id: str) -> None:
         attempts = self.net.reconnect_attempts.get(peer_id, 0)
-        if attempts >= 5:
+        if attempts >= MAX_RECONNECT_ATTEMPTS:
             return
-        delay = min(2 ** attempts + random.uniform(0, 1), 30)
+        delay = min(2 ** attempts + random.uniform(0, 1), RECONNECT_BACKOFF_MAX)
         QTimer.singleShot(int(delay * 1000), lambda pid=peer_id: self.net._try_reconnect(pid))
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
@@ -1277,7 +1449,7 @@ class MainWindow(QMainWindow):
         self.diag_widget = DiagnosticsWidget(self.net)
         self.tabs.addTab(self.diag_widget, "🩺 Диагностика")
 
-    def _load_contacts(self):
+    def _load_contacts(self) -> None:
         contacts = self.db.get_all_contacts()
         for machine_id, nickname in contacts:
             if machine_id != MY_MACHINE_ID:
@@ -1289,7 +1461,7 @@ class MainWindow(QMainWindow):
             self.unread_counts[mid] = count
         self._update_contact_display()
 
-    def update_contacts(self, peers):
+    def update_contacts(self, peers: dict) -> None:
         current = self.contact_list.currentItem()
         current_id = current.data(Qt.UserRole) if current else None
         self.contact_list.clear()
@@ -1302,7 +1474,7 @@ class MainWindow(QMainWindow):
             display = f"🖥 {safe_nick}"
             if unread > 0:
                 display += f"  ({unread})"
-            if last_hello > 0 and now - last_hello < 20:
+            if last_hello > 0 and now - last_hello < PEER_TIMEOUT:
                 online.append((mid, display))
             else:
                 offline.append((mid, display))
@@ -1323,7 +1495,7 @@ class MainWindow(QMainWindow):
                     break
         self.filter_contacts(self.contact_filter.text())
 
-    def filter_contacts(self, text):
+    def filter_contacts(self, text: str) -> None:
         for i in range(self.contact_list.count()):
             item = self.contact_list.item(i)
             if text.lower() in item.text().lower():
@@ -1331,7 +1503,7 @@ class MainWindow(QMainWindow):
             else:
                 item.setHidden(True)
 
-    def on_contact_clicked(self, item):
+    def on_contact_clicked(self, item: QListWidgetItem) -> None:
         self.current_peer = item.data(Qt.UserRole)
         self.history_offset[self.current_peer] = None
         self.load_chat_history(self.current_peer)
@@ -1341,7 +1513,7 @@ class MainWindow(QMainWindow):
         self.unread_counts[self.current_peer] = 0
         self._update_contact_display()
 
-    def load_chat_history(self, peer_id):
+    def load_chat_history(self, peer_id: str) -> None:
         self.chat_display.clear()
         messages = self.db.get_chat_history(peer_id, limit=50)
         for row in messages:
@@ -1349,7 +1521,7 @@ class MainWindow(QMainWindow):
         if messages:
             self.history_offset[peer_id] = messages[0][0]
 
-    def _append_message(self, row):
+    def _append_message(self, row: tuple) -> None:
         msg_id, sender_id, sender_name, message, file_name, file_path, is_folder, timestamp = row
         time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
         safe_sender = html.escape(sender_name)
@@ -1365,7 +1537,7 @@ class MainWindow(QMainWindow):
             safe_msg = html.escape(message)
             self.chat_display.append(f"<b>[{time_str}] {safe_sender}:</b> {safe_msg}")
 
-    def load_more_history(self):
+    def load_more_history(self) -> None:
         if not self.current_peer:
             return
         oldest = self.history_offset.get(self.current_peer)
@@ -1392,7 +1564,7 @@ class MainWindow(QMainWindow):
 
         self.history_offset[self.current_peer] = older[0][0]
 
-    def display_message(self, sender_id, nick, text, file_name, local_path, is_folder):
+    def display_message(self, sender_id: str, nick: str, text: str, file_name: str, local_path: str, is_folder: bool) -> None:
         safe_nick = html.escape(nick)
         if self.current_peer != sender_id or not self.isActiveWindow():
             self.unread_counts[sender_id] = self.unread_counts.get(sender_id, 0) + 1
@@ -1417,7 +1589,7 @@ class MainWindow(QMainWindow):
                 self.chat_display.append(f"<b>[{time_str}] {safe_nick}:</b> {html.escape(text)}")
             self.chat_display.moveCursor(QTextCursor.End)
 
-    def _on_anchor_clicked(self, url):
+    def _on_anchor_clicked(self, url: QUrl) -> None:
         if url.scheme() == "mestochat" and url.host() == "open_file":
             from PyQt5.QtCore import QUrlQuery
             query = QUrlQuery(url)
@@ -1438,7 +1610,7 @@ class MainWindow(QMainWindow):
                         return
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-    def send_message(self):
+    def send_message(self) -> None:
         if not self.current_peer:
             return
         text = self.message_input.text().strip()
@@ -1451,7 +1623,7 @@ class MainWindow(QMainWindow):
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не доставлено (сохранено для отправки)</i>")
 
-    def select_and_send_files(self):
+    def select_and_send_files(self) -> None:
         if not self.current_peer:
             QMessageBox.warning(self, "Ошибка", "Выберите контакт.")
             return
@@ -1459,7 +1631,7 @@ class MainWindow(QMainWindow):
         for f in files:
             self.offer_file(f, is_folder=False)
 
-    def on_file_dropped(self, file_path, is_folder):
+    def on_file_dropped(self, file_path: str, is_folder: bool) -> None:
         if not self.current_peer:
             QMessageBox.warning(self, "Ошибка", "Сначала выберите контакт в списке.")
             return
@@ -1468,13 +1640,13 @@ class MainWindow(QMainWindow):
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не удалось предложить файл (контакт офлайн?)</i>")
 
-    def offer_file(self, file_path, is_folder=False):
+    def offer_file(self, file_path: str, is_folder: bool = False) -> None:
         if self.net.send_file_request(self.current_peer, file_path, is_folder=is_folder):
             self.chat_display.append(f"<b>Вы:</b> <i>Предложен файл: {html.escape(os.path.basename(file_path))}</i>")
         else:
             self.chat_display.append("<i style='color:red'>⚠ Не удалось предложить файл (контакт офлайн?)</i>")
 
-    def handle_incoming_file(self, sender_id, nick, file_name, file_size, request_id, is_folder):
+    def handle_incoming_file(self, sender_id: str, nick: str, file_name: str, file_size: int, request_id: str, is_folder: bool) -> None:
         item_type = "папку" if is_folder else "файл"
         reply = QMessageBox.question(
             self,
@@ -1484,30 +1656,30 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             accept_msg = json.dumps({'type': 'file_accept', 'request_id': request_id})
-            with self.net.lock:
+            with self.net.state_lock:
                 sock = self.net.connections.get(sender_id)
             if sock:
                 try:
                     self.net._send_frame(sock, accept_msg)
-                except:
-                    pass
+                except Exception:
+                    logger.exception("Error sending file accept")
         else:
             reject_msg = json.dumps({'type': 'file_reject', 'request_id': request_id})
-            with self.net.lock:
+            with self.net.state_lock:
                 sock = self.net.connections.get(sender_id)
             if sock:
                 try:
                     self.net._send_frame(sock, reject_msg)
-                except:
-                    pass
+                except Exception:
+                    logger.exception("Error sending file reject")
 
-    def on_file_transfer_failed(self, peer_id, error_msg):
+    def on_file_transfer_failed(self, peer_id: str, error_msg: str) -> None:
         if self.current_peer == peer_id and self.stack.currentIndex() == 0:
             self.chat_display.append(f"<i style='color:red'>⚠ {html.escape(error_msg)}</i>")
         else:
             QMessageBox.warning(self, "Ошибка передачи файла", html.escape(error_msg))
 
-    def search_messages(self):
+    def search_messages(self) -> None:
         query = self.search_input.text().strip()
         if query:
             results = self.db.search_messages(query)
@@ -1519,13 +1691,13 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(1)
             self.back_btn.show()
 
-    def return_to_chat(self):
+    def return_to_chat(self) -> None:
         self.stack.setCurrentIndex(0)
         self.back_btn.hide()
         if self.current_peer:
             self.load_chat_history(self.current_peer)
 
-    def export_chat(self):
+    def export_chat(self) -> None:
         if not self.current_peer:
             return
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт чата", f"chat_{self.current_peer}.txt", "Текстовые файлы (*.txt)")
@@ -1534,11 +1706,11 @@ class MainWindow(QMainWindow):
                 f.write(self.chat_display.toPlainText())
             QMessageBox.information(self, "Готово", f"Чат сохранён в {path}")
 
-    def open_downloads_folder(self):
+    def open_downloads_folder(self) -> None:
         folder = config.get('download_path', DEFAULT_DOWNLOADS_DIR)
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
-    def change_nickname(self):
+    def change_nickname(self) -> None:
         new_nick, ok = QInputDialog.getText(self, "Сменить ник", "Новый никнейм:", text=self.nickname)
         if ok and new_nick.strip():
             new_nick = new_nick.strip()
@@ -1547,19 +1719,19 @@ class MainWindow(QMainWindow):
                 self.setWindowTitle(f"MestoChat — {html.escape(new_nick)}")
                 self.net.update_nickname(new_nick)
 
-    def open_settings(self):
+    def open_settings(self) -> None:
         dlg = SettingsDialog(self)
         if dlg.exec_() == QDialog.Accepted:
             QMessageBox.information(self, "Настройки", "Изменения вступят в силу после перезапуска программы.")
 
-    def show_error(self, msg):
+    def show_error(self, msg: str) -> None:
         QMessageBox.critical(self, "Ошибка", msg)
 
-    def on_tray_activated(self, reason):
+    def on_tray_activated(self, reason: int) -> None:
         if reason == QSystemTrayIcon.Trigger:
             self.show()
 
-    def closeEvent(self, event):
+    def closeEvent(self, event) -> None:
         if self.tray_icon.isVisible():
             self.hide()
             self.tray_icon.showMessage("MestoChat", "Программа свернута в трей.", QSystemTrayIcon.Information, 2000)
@@ -1567,13 +1739,12 @@ class MainWindow(QMainWindow):
         else:
             self.full_quit()
 
-    def full_quit(self):
-        self.net.stop()
+    def full_quit(self) -> None:
+        self.net.shutdown()
         self.tray_icon.hide()
-        executor.shutdown(wait=False)
         QApplication.quit()
 
-    def _update_contact_display(self):
+    def _update_contact_display(self) -> None:
         for i in range(self.contact_list.count()):
             item = self.contact_list.item(i)
             mid = item.data(Qt.UserRole)
